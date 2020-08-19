@@ -21,6 +21,7 @@
 
 #include <arrow/dataset/api.h>
 #include <arrow/filesystem/filesystem.h>
+#include <arrow/table.h>
 #include <arrow/util/iterator.h>
 
 namespace ds = ::arrow::dataset;
@@ -262,6 +263,25 @@ std::shared_ptr<arrow::Table> dataset___Scanner__ToTable(
 }
 
 // [[arrow::export]]
+std::shared_ptr<arrow::Table> dataset___Scanner__head(
+    const std::shared_ptr<ds::Scanner>& scanner, int n) {
+  // TODO: make this a full Slice with offset > 0
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  std::shared_ptr<arrow::RecordBatch> current_batch;
+
+  for (auto st : ValueOrStop(scanner->Scan())) {
+    for (auto b : ValueOrStop(ValueOrStop(st)->Execute())) {
+      current_batch = ValueOrStop(b);
+      batches.push_back(current_batch->Slice(0, n));
+      n -= current_batch->num_rows();
+      if (n < 0) break;
+    }
+    if (n < 0) break;
+  }
+  return ValueOrStop(arrow::Table::FromRecordBatches(std::move(batches)));
+}
+
+// [[arrow::export]]
 std::vector<std::shared_ptr<ds::ScanTask>> dataset___Scanner__Scan(
     const std::shared_ptr<ds::Scanner>& scanner) {
   auto it = ValueOrStop(scanner->Scan());
@@ -287,6 +307,21 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> dataset___ScanTask__get_batches
     out.push_back(batch);
   }
   return out;
+}
+
+// [[arrow::export]]
+void dataset___Dataset__Write(const std::shared_ptr<ds::Dataset>& ds,
+                              const std::shared_ptr<arrow::Schema>& schema,
+                              const std::shared_ptr<ds::FileFormat>& format,
+                              const std::shared_ptr<fs::FileSystem>& filesystem,
+                              std::string path,
+                              const std::shared_ptr<ds::Partitioning>& partitioning) {
+  auto frags = ds->GetFragments();
+  auto ctx = std::make_shared<ds::ScanContext>();
+  ctx->use_threads = true;
+  StopIfNotOk(ds::FileSystemDataset::Write(schema, format, filesystem, path, partitioning,
+                                           ctx, std::move(frags)));
+  return;
 }
 
 #endif

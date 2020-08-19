@@ -243,21 +243,6 @@ RcppExport SEXP _arrow_Array__View(SEXP array_sexp, SEXP type_sexp){
 
 // array.cpp
 #if defined(ARROW_R_WITH_ARROW)
-LogicalVector Array__Mask(const std::shared_ptr<arrow::Array>& array);
-RcppExport SEXP _arrow_Array__Mask(SEXP array_sexp){
-BEGIN_RCPP
-	Rcpp::traits::input_parameter<const std::shared_ptr<arrow::Array>&>::type array(array_sexp);
-	return Rcpp::wrap(Array__Mask(array));
-END_RCPP
-}
-#else
-RcppExport SEXP _arrow_Array__Mask(SEXP array_sexp){
-	Rf_error("Cannot call Array__Mask(). Please use arrow::install_arrow() to install required runtime libraries. ");
-}
-#endif
-
-// array.cpp
-#if defined(ARROW_R_WITH_ARROW)
 void Array__Validate(const std::shared_ptr<arrow::Array>& array);
 RcppExport SEXP _arrow_Array__Validate(SEXP array_sexp){
 BEGIN_RCPP
@@ -1761,6 +1746,22 @@ RcppExport SEXP _arrow_dataset___Scanner__ToTable(SEXP scanner_sexp){
 
 // dataset.cpp
 #if defined(ARROW_R_WITH_ARROW)
+std::shared_ptr<arrow::Table> dataset___Scanner__head(const std::shared_ptr<ds::Scanner>& scanner, int n);
+RcppExport SEXP _arrow_dataset___Scanner__head(SEXP scanner_sexp, SEXP n_sexp){
+BEGIN_RCPP
+	Rcpp::traits::input_parameter<const std::shared_ptr<ds::Scanner>&>::type scanner(scanner_sexp);
+	Rcpp::traits::input_parameter<int>::type n(n_sexp);
+	return Rcpp::wrap(dataset___Scanner__head(scanner, n));
+END_RCPP
+}
+#else
+RcppExport SEXP _arrow_dataset___Scanner__head(SEXP scanner_sexp, SEXP n_sexp){
+	Rf_error("Cannot call dataset___Scanner__head(). Please use arrow::install_arrow() to install required runtime libraries. ");
+}
+#endif
+
+// dataset.cpp
+#if defined(ARROW_R_WITH_ARROW)
 std::vector<std::shared_ptr<ds::ScanTask>> dataset___Scanner__Scan(const std::shared_ptr<ds::Scanner>& scanner);
 RcppExport SEXP _arrow_dataset___Scanner__Scan(SEXP scanner_sexp){
 BEGIN_RCPP
@@ -1786,6 +1787,27 @@ END_RCPP
 #else
 RcppExport SEXP _arrow_dataset___ScanTask__get_batches(SEXP scan_task_sexp){
 	Rf_error("Cannot call dataset___ScanTask__get_batches(). Please use arrow::install_arrow() to install required runtime libraries. ");
+}
+#endif
+
+// dataset.cpp
+#if defined(ARROW_R_WITH_ARROW)
+void dataset___Dataset__Write(const std::shared_ptr<ds::Dataset>& ds, const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<ds::FileFormat>& format, const std::shared_ptr<fs::FileSystem>& filesystem, std::string path, const std::shared_ptr<ds::Partitioning>& partitioning);
+RcppExport SEXP _arrow_dataset___Dataset__Write(SEXP ds_sexp, SEXP schema_sexp, SEXP format_sexp, SEXP filesystem_sexp, SEXP path_sexp, SEXP partitioning_sexp){
+BEGIN_RCPP
+	Rcpp::traits::input_parameter<const std::shared_ptr<ds::Dataset>&>::type ds(ds_sexp);
+	Rcpp::traits::input_parameter<const std::shared_ptr<arrow::Schema>&>::type schema(schema_sexp);
+	Rcpp::traits::input_parameter<const std::shared_ptr<ds::FileFormat>&>::type format(format_sexp);
+	Rcpp::traits::input_parameter<const std::shared_ptr<fs::FileSystem>&>::type filesystem(filesystem_sexp);
+	Rcpp::traits::input_parameter<std::string>::type path(path_sexp);
+	Rcpp::traits::input_parameter<const std::shared_ptr<ds::Partitioning>&>::type partitioning(partitioning_sexp);
+	dataset___Dataset__Write(ds, schema, format, filesystem, path, partitioning);
+	return R_NilValue;
+END_RCPP
+}
+#else
+RcppExport SEXP _arrow_dataset___Dataset__Write(SEXP ds_sexp, SEXP schema_sexp, SEXP format_sexp, SEXP filesystem_sexp, SEXP path_sexp, SEXP partitioning_sexp){
+	Rf_error("Cannot call dataset___Dataset__Write(). Please use arrow::install_arrow() to install required runtime libraries. ");
 }
 #endif
 
@@ -5940,7 +5962,6 @@ static const R_CallMethodDef CallEntries[] = {
 		{ "_arrow_Array__data", (DL_FUNC) &_arrow_Array__data, 1}, 
 		{ "_arrow_Array__RangeEquals", (DL_FUNC) &_arrow_Array__RangeEquals, 5}, 
 		{ "_arrow_Array__View", (DL_FUNC) &_arrow_Array__View, 2}, 
-		{ "_arrow_Array__Mask", (DL_FUNC) &_arrow_Array__Mask, 1}, 
 		{ "_arrow_Array__Validate", (DL_FUNC) &_arrow_Array__Validate, 1}, 
 		{ "_arrow_DictionaryArray__indices", (DL_FUNC) &_arrow_DictionaryArray__indices, 1}, 
 		{ "_arrow_DictionaryArray__dictionary", (DL_FUNC) &_arrow_DictionaryArray__dictionary, 1}, 
@@ -6037,8 +6058,10 @@ static const R_CallMethodDef CallEntries[] = {
 		{ "_arrow_dataset___ScannerBuilder__schema", (DL_FUNC) &_arrow_dataset___ScannerBuilder__schema, 1}, 
 		{ "_arrow_dataset___ScannerBuilder__Finish", (DL_FUNC) &_arrow_dataset___ScannerBuilder__Finish, 1}, 
 		{ "_arrow_dataset___Scanner__ToTable", (DL_FUNC) &_arrow_dataset___Scanner__ToTable, 1}, 
+		{ "_arrow_dataset___Scanner__head", (DL_FUNC) &_arrow_dataset___Scanner__head, 2}, 
 		{ "_arrow_dataset___Scanner__Scan", (DL_FUNC) &_arrow_dataset___Scanner__Scan, 1}, 
 		{ "_arrow_dataset___ScanTask__get_batches", (DL_FUNC) &_arrow_dataset___ScanTask__get_batches, 1}, 
+		{ "_arrow_dataset___Dataset__Write", (DL_FUNC) &_arrow_dataset___Dataset__Write, 6}, 
 		{ "_arrow_shared_ptr_is_null", (DL_FUNC) &_arrow_shared_ptr_is_null, 1}, 
 		{ "_arrow_unique_ptr_is_null", (DL_FUNC) &_arrow_unique_ptr_is_null, 1}, 
 		{ "_arrow_Int8__initialize", (DL_FUNC) &_arrow_Int8__initialize, 0}, 

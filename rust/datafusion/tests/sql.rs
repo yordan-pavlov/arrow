@@ -25,13 +25,11 @@ use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use datafusion::datasource::csv::CsvReadOptions;
+use datafusion::datasource::{csv::CsvReadOptions, MemTable};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionContext;
 use datafusion::execution::physical_plan::udf::ScalarFunction;
 use datafusion::logicalplan::LogicalPlan;
-
-const DEFAULT_BATCH_SIZE: usize = 1024 * 1024;
 
 #[test]
 fn nyc() -> Result<()> {
@@ -111,7 +109,7 @@ fn parquet_single_nan_schema() {
     let sql = "SELECT mycol FROM single_nan";
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
     let results = ctx.collect(plan.as_ref()).unwrap();
     for batch in results {
         assert_eq!(1, batch.num_rows());
@@ -150,6 +148,44 @@ fn csv_query_group_by_int_min_max() -> Result<()> {
     actual.sort();
     let expected = "1\t0.05636955101974106\t0.9965400387585364\n2\t0.16301110515739792\t0.991517828651004\n3\t0.047343434291126085\t0.9293883502480845\n4\t0.02182578039211991\t0.9237877978193884\n5\t0.01479305307777301\t0.9723580396501548".to_string();
     assert_eq!(expected, actual.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn csv_query_group_by_two_columns() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c1, c2, MIN(c3) FROM aggregate_test_100 GROUP BY c1, c2";
+    let mut actual = execute(&mut ctx, sql);
+    actual.sort();
+    let expected = [
+        "\"a\"\t1\t-85",
+        "\"a\"\t2\t-48",
+        "\"a\"\t3\t-72",
+        "\"a\"\t4\t-101",
+        "\"a\"\t5\t-101",
+        "\"b\"\t1\t12",
+        "\"b\"\t2\t-60",
+        "\"b\"\t3\t-101",
+        "\"b\"\t4\t-117",
+        "\"b\"\t5\t-82",
+        "\"c\"\t1\t-24",
+        "\"c\"\t2\t-117",
+        "\"c\"\t3\t-2",
+        "\"c\"\t4\t-90",
+        "\"c\"\t5\t-94",
+        "\"d\"\t1\t-99",
+        "\"d\"\t2\t93",
+        "\"d\"\t3\t-76",
+        "\"d\"\t4\t5",
+        "\"d\"\t5\t-59",
+        "\"e\"\t1\t36",
+        "\"e\"\t2\t-61",
+        "\"e\"\t3\t-95",
+        "\"e\"\t4\t-56",
+        "\"e\"\t5\t-86",
+    ];
+    assert_eq!(expected.join("\n"), actual.join("\n"));
     Ok(())
 }
 
@@ -239,7 +275,7 @@ fn csv_query_avg_multi_batch() -> Result<()> {
     let sql = "SELECT avg(c12) FROM aggregate_test_100";
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
     let results = ctx.collect(plan.as_ref()).unwrap();
     let batch = &results[0];
     let column = batch.column(0);
@@ -279,7 +315,7 @@ fn csv_query_group_by_int_count() -> Result<()> {
 fn csv_query_group_by_string_min_max() -> Result<()> {
     let mut ctx = ExecutionContext::new();
     register_aggregate_csv(&mut ctx)?;
-    let sql = "SELECT c2, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c1";
+    let sql = "SELECT c1, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c1";
     let mut actual = execute(&mut ctx, sql);
     actual.sort();
     let expected =
@@ -394,6 +430,40 @@ fn csv_query_count_one() {
     assert_eq!(expected, actual);
 }
 
+#[test]
+fn csv_explain() {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    let sql = "EXPLAIN SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    let expected = "\"logical_plan\"\t\"Projection: #c1\\n  Filter: #c2 Gt Int64(10)\\n    TableScan: aggregate_test_100 projection=None\"".to_string();
+    assert_eq!(expected, actual);
+
+    // Also, expect same result with lowercase explain
+    let sql = "explain SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn csv_explain_verbose() {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    let sql = "EXPLAIN VERBOSE SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    // Don't actually test the contents of the debuging output (as
+    // that may change and keeping this test updated will be a
+    // pain). Instead just check for a few key pieces.
+    assert!(actual.contains("logical_plan"), "Actual: '{}'", actual);
+    assert!(actual.contains("physical_plan"), "Actual: '{}'", actual);
+    assert!(actual.contains("type_coercion"), "Actual: '{}'", actual);
+    assert!(
+        actual.contains("CAST(#c2 AS Int64) Gt Int64(10)"),
+        "Actual: '{}'",
+        actual
+    );
+}
+
 fn aggr_test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("c1", DataType::Utf8, false),
@@ -417,9 +487,8 @@ fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
 
     // TODO: The following c9 should be migrated to UInt32 and c10 should be UInt64 once
     // unsigned is supported.
-    ctx.sql(
-        &format!(
-            "
+    ctx.sql(&format!(
+        "
     CREATE EXTERNAL TABLE aggregate_test_100 (
         c1  VARCHAR NOT NULL,
         c2  INT NOT NULL,
@@ -439,10 +508,8 @@ fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
     WITH HEADER ROW
     LOCATION '{}/csv/aggregate_test_100.csv'
     ",
-            testdata
-        ),
-        1024,
-    )
+        testdata
+    ))
     .unwrap();
 }
 
@@ -470,7 +537,7 @@ fn register_alltypes_parquet(ctx: &mut ExecutionContext) {
 fn execute(ctx: &mut ExecutionContext, sql: &str) -> Vec<String> {
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
     let results = ctx.collect(plan.as_ref()).unwrap();
     result_str(&results)
 }
@@ -546,4 +613,24 @@ fn result_str(results: &[RecordBatch]) -> Vec<String> {
         }
     }
     result
+}
+
+#[test]
+fn query_length() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8, false)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["", "a", "aa", "aaa"]))],
+    )?;
+
+    let table = MemTable::new(schema, vec![vec![data]])?;
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Box::new(table));
+    let sql = "SELECT length(c1) FROM test";
+    let actual = execute(&mut ctx, sql).join("\n");
+    let expected = "0\n1\n2\n3".to_string();
+    assert_eq!(expected, actual);
+    Ok(())
 }

@@ -60,10 +60,6 @@ Array__View <- function(array, type){
     .Call(`_arrow_Array__View` , array, type)
 }
 
-Array__Mask <- function(array){
-    .Call(`_arrow_Array__Mask` , array)
-}
-
 Array__Validate <- function(array){
     invisible(.Call(`_arrow_Array__Validate` , array))
 }
@@ -448,12 +444,20 @@ dataset___Scanner__ToTable <- function(scanner){
     .Call(`_arrow_dataset___Scanner__ToTable` , scanner)
 }
 
+dataset___Scanner__head <- function(scanner, n){
+    .Call(`_arrow_dataset___Scanner__head` , scanner, n)
+}
+
 dataset___Scanner__Scan <- function(scanner){
     .Call(`_arrow_dataset___Scanner__Scan` , scanner)
 }
 
 dataset___ScanTask__get_batches <- function(scan_task){
     .Call(`_arrow_dataset___ScanTask__get_batches` , scan_task)
+}
+
+dataset___Dataset__Write <- function(ds, schema, format, filesystem, path, partitioning){
+    invisible(.Call(`_arrow_dataset___Dataset__Write` , ds, schema, format, filesystem, path, partitioning))
 }
 
 shared_ptr_is_null <- function(xp){

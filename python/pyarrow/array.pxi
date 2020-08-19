@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import warnings
 
 
@@ -31,6 +32,7 @@ cdef _sequence_to_array(object sequence, object mask, object size,
 
     options.pool = pool
     options.from_pandas = from_pandas
+    options.ignore_timezone = os.environ.get('PYARROW_IGNORE_TIMEZONE', False)
 
     cdef shared_ptr[CChunkedArray] out
 
@@ -619,7 +621,7 @@ def _restore_array(data):
     return pyarrow_wrap_array(MakeArray(ad))
 
 
-cdef class _PandasConvertible:
+cdef class _PandasConvertible(_Weakrefable):
 
     def to_pandas(
             self,
@@ -730,6 +732,7 @@ cdef PandasOptions _convert_pandas_options(dict options):
     result.safe_cast = options['safe']
     result.split_blocks = options['split_blocks']
     result.self_destruct = options['self_destruct']
+    result.ignore_timezone = os.environ.get('PYARROW_IGNORE_TIMEZONE', False)
     return result
 
 

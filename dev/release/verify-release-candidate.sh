@@ -73,6 +73,7 @@ if [ -z "${ARROW_CUDA:-}" ] && detect_cuda; then
 fi
 : ${ARROW_CUDA:=OFF}
 : ${ARROW_FLIGHT:=ON}
+: ${ARROW_GANDIVA:=ON}
 
 ARROW_DIST_URL='https://dist.apache.org/repos/dist/dev/arrow'
 
@@ -142,17 +143,8 @@ test_apt() {
                 "arm64v8/ubuntu:xenial" \
                 "ubuntu:bionic" \
                 "arm64v8/ubuntu:bionic" \
-                "ubuntu:eoan" \
-                "arm64v8/ubuntu:eoan" \
                 "ubuntu:focal" \
                 "arm64v8/ubuntu:focal"; do \
-    # We can't build some arm64 binaries by Crossbow for now.
-    if [ "${target}" = "arm64v8/debian:stretch" ]; then continue; fi
-    if [ "${target}" = "arm64v8/debian:buster" ]; then continue; fi
-    if [ "${target}" = "arm64v8/ubuntu:xenial" ]; then continue; fi
-    if [ "${target}" = "arm64v8/ubuntu:bionic" ]; then continue; fi
-    if [ "${target}" = "arm64v8/ubuntu:eoan" ]; then continue; fi
-    if [ "${target}" = "arm64v8/ubuntu:focal" ]; then continue; fi
     case "${target}" in
       arm64v8/*)
         if [ "$(arch)" = "aarch64" -o -e /usr/bin/qemu-aarch64-static ]; then
@@ -180,9 +172,6 @@ test_yum() {
                 "arm64v8/centos:7" \
                 "centos:8" \
                 "arm64v8/centos:8"; do
-    # We can't build some arm64 binaries by Crossbow for now.
-    if [ "${target}" = "arm64v8/centos:7" ]; then continue; fi
-    if [ "${target}" = "arm64v8/centos:8" ]; then continue; fi
     case "${target}" in
       arm64v8/*)
         if [ "$(arch)" = "aarch64" -o -e /usr/bin/qemu-aarch64-static ]; then
@@ -278,7 +267,7 @@ ${ARROW_CMAKE_OPTIONS:-}
 -DARROW_PLASMA=ON
 -DARROW_ORC=ON
 -DARROW_PYTHON=ON
--DARROW_GANDIVA=ON
+-DARROW_GANDIVA=${ARROW_GANDIVA}
 -DARROW_PARQUET=ON
 -DARROW_DATASET=ON
 -DPARQUET_REQUIRE_ENCRYPTION=ON
@@ -372,7 +361,6 @@ test_python() {
   pip install -r requirements-build.txt -r requirements-test.txt
 
   export PYARROW_WITH_DATASET=1
-  export PYARROW_WITH_GANDIVA=1
   export PYARROW_WITH_PARQUET=1
   export PYARROW_WITH_PLASMA=1
   if [ "${ARROW_CUDA}" = "ON" ]; then
@@ -380,6 +368,9 @@ test_python() {
   fi
   if [ "${ARROW_FLIGHT}" = "ON" ]; then
     export PYARROW_WITH_FLIGHT=1
+  fi
+  if [ "${ARROW_GANDIVA}" = "ON" ]; then
+    export PYARROW_WITH_GANDIVA=1
   fi
 
   python setup.py build_ext --inplace
@@ -408,7 +399,7 @@ test_glib() {
   export GI_TYPELIB_PATH=$ARROW_HOME/lib/girepository-1.0:$GI_TYPELIB_PATH
 
   if ! bundle --version; then
-    gem install bundler
+    gem install --no-document bundler
   fi
 
   bundle install --path vendor/bundle

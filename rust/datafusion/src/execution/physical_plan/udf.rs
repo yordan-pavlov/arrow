@@ -17,6 +17,8 @@
 
 //! UDF support
 
+use std::fmt;
+
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -24,6 +26,7 @@ use crate::error::Result;
 use crate::execution::physical_plan::PhysicalExpr;
 
 use arrow::record_batch::RecordBatch;
+use fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 /// Scalar UDF
@@ -40,6 +43,17 @@ pub struct ScalarFunction {
     pub return_type: DataType,
     /// UDF implementation
     pub fun: ScalarUdf,
+}
+
+impl Debug for ScalarFunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScalarFunction")
+            .field("name", &self.name)
+            .field("args", &self.args)
+            .field("return_type", &self.return_type)
+            .field("fun", &"<FUNC>")
+            .finish()
+    }
 }
 
 impl ScalarFunction {
@@ -61,10 +75,21 @@ impl ScalarFunction {
 
 /// Scalar UDF Physical Expression
 pub struct ScalarFunctionExpr {
-    name: String,
     fun: Box<ScalarUdf>,
+    name: String,
     args: Vec<Arc<dyn PhysicalExpr>>,
     return_type: DataType,
+}
+
+impl Debug for ScalarFunctionExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScalarFunctionExpr")
+            .field("fun", &"<FUNC>")
+            .field("name", &self.name)
+            .field("args", &self.args)
+            .field("return_type", &self.return_type)
+            .finish()
+    }
 }
 
 impl ScalarFunctionExpr {
@@ -76,19 +101,30 @@ impl ScalarFunctionExpr {
         return_type: &DataType,
     ) -> Self {
         Self {
-            name: name.to_owned(),
             fun,
+            name: name.to_owned(),
             args,
             return_type: return_type.clone(),
         }
     }
 }
 
-impl PhysicalExpr for ScalarFunctionExpr {
-    fn name(&self) -> String {
-        self.name.clone()
+impl fmt::Display for ScalarFunctionExpr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}({})",
+            self.name,
+            self.args
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<String>>()
+                .join(", ")
+        )
     }
+}
 
+impl PhysicalExpr for ScalarFunctionExpr {
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
         Ok(self.return_type.clone())
     }

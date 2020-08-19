@@ -648,6 +648,7 @@ inline Status ConvertStruct(const PandasOptions& options, const ChunkedArray& da
   // units second through microsecond but PyLong for nanosecond (because
   // datetime.datetime does not support nanoseconds).
   // We force the object conversion to preserve the value of the timezone.
+  // Nanoseconds are returned integers inside of structs.
   PandasOptions modified_options = options;
   modified_options.coerce_temporal_nanoseconds = false;
 
@@ -657,7 +658,7 @@ inline Status ConvertStruct(const PandasOptions& options, const ChunkedArray& da
     for (int32_t i = 0; i < num_fields; i++) {
       PyObject* numpy_array;
       std::shared_ptr<Array> field = arr->field(static_cast<int>(i));
-      // Seen notes above about timstamp conversion.  Don't blindly convert because
+      // See notes above about timestamp conversion.  Don't blindly convert because
       // timestamps in lists are handled differently.
       modified_options.timestamp_as_object =
           field->type()->id() == Type::TIMESTAMP ? true : options.timestamp_as_object;
@@ -954,24 +955,38 @@ struct ObjectWriterVisitor {
   enable_if_timestamp<Type, Status> Visit(const Type& type) {
     const TimeUnit::type unit = type.unit();
     OwnedRef tzinfo;
-    if (!type.timezone().empty()) {
-      RETURN_NOT_OK(internal::StringToTzinfo(type.timezone(), tzinfo.ref()));
-      RETURN_IF_PYERROR();
-    }
-    auto WrapValue = [&](typename Type::c_type value, PyObject** out) {
-      RETURN_NOT_OK(internal::PyDateTime_from_int(value, unit, out));
-      RETURN_IF_PYERROR();
-      if (tzinfo.obj() != nullptr) {
-        PyObject* with_tz = PyObject_CallMethod(tzinfo.obj(), "fromutc", "O", *out);
-        RETURN_IF_PYERROR();
-        Py_DECREF(*out);
-        *out = with_tz;
-      }
 
+    auto ConvertTimezoneNaive = [&](typename Type::c_type value, PyObject** out) {
+      RETURN_NOT_OK(internal::PyDateTime_from_int(value, unit, out));
       RETURN_IF_PYERROR();
       return Status::OK();
     };
-    return ConvertAsPyObjects<Type>(options, data, WrapValue, out_values);
+    auto ConvertTimezoneAware = [&](typename Type::c_type value, PyObject** out) {
+      PyObject* naive_datetime;
+      RETURN_NOT_OK(ConvertTimezoneNaive(value, &naive_datetime));
+      // convert the timezone naive datetime object to timezone aware
+      *out = PyObject_CallMethod(tzinfo.obj(), "fromutc", "O", naive_datetime);
+      // the timezone naive object is no longer required
+      Py_DECREF(naive_datetime);
+      RETURN_IF_PYERROR();
+      return Status::OK();
+    };
+
+    if (!type.timezone().empty() && !options.ignore_timezone) {
+      // convert timezone aware
+      PyObject* tzobj;
+      ARROW_ASSIGN_OR_RAISE(tzobj, internal::StringToTzinfo(type.timezone()));
+      tzinfo.reset(tzobj);
+      RETURN_IF_PYERROR();
+      RETURN_NOT_OK(
+          ConvertAsPyObjects<Type>(options, data, ConvertTimezoneAware, out_values));
+    } else {
+      // convert timezone naive
+      RETURN_NOT_OK(
+          ConvertAsPyObjects<Type>(options, data, ConvertTimezoneNaive, out_values));
+    }
+
+    return Status::OK();
   }
 
   Status Visit(const Decimal128Type& type) {

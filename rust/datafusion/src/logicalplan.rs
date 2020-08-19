@@ -21,7 +21,7 @@
 //! Logical query plans can then be optimized and executed directly, or translated into
 //! physical query plans and executed.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -125,6 +125,30 @@ pub enum Operator {
     NotLike,
 }
 
+impl fmt::Display for Operator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let display = match &self {
+            Operator::Eq => "=",
+            Operator::NotEq => "!=",
+            Operator::Lt => "<",
+            Operator::LtEq => "<=",
+            Operator::Gt => ">",
+            Operator::GtEq => ">=",
+            Operator::Plus => "+",
+            Operator::Minus => "-",
+            Operator::Multiply => "*",
+            Operator::Divide => "/",
+            Operator::Modulus => "%",
+            Operator::And => "AND",
+            Operator::Or => "OR",
+            Operator::Not => "NOT",
+            Operator::Like => "LIKE",
+            Operator::NotLike => "NOT LIKE",
+        };
+        write!(f, "{}", display)
+    }
+}
+
 /// ScalarValue enumeration
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarValue {
@@ -160,23 +184,98 @@ pub enum ScalarValue {
 
 impl ScalarValue {
     /// Getter for the `DataType` of the value
-    pub fn get_datatype(&self) -> DataType {
+    pub fn get_datatype(&self) -> Result<DataType> {
         match *self {
-            ScalarValue::Boolean(_) => DataType::Boolean,
-            ScalarValue::UInt8(_) => DataType::UInt8,
-            ScalarValue::UInt16(_) => DataType::UInt16,
-            ScalarValue::UInt32(_) => DataType::UInt32,
-            ScalarValue::UInt64(_) => DataType::UInt64,
-            ScalarValue::Int8(_) => DataType::Int8,
-            ScalarValue::Int16(_) => DataType::Int16,
-            ScalarValue::Int32(_) => DataType::Int32,
-            ScalarValue::Int64(_) => DataType::Int64,
-            ScalarValue::Float32(_) => DataType::Float32,
-            ScalarValue::Float64(_) => DataType::Float64,
-            ScalarValue::Utf8(_) => DataType::Utf8,
-            _ => panic!("Cannot treat {:?} as scalar value", self),
+            ScalarValue::Boolean(_) => Ok(DataType::Boolean),
+            ScalarValue::UInt8(_) => Ok(DataType::UInt8),
+            ScalarValue::UInt16(_) => Ok(DataType::UInt16),
+            ScalarValue::UInt32(_) => Ok(DataType::UInt32),
+            ScalarValue::UInt64(_) => Ok(DataType::UInt64),
+            ScalarValue::Int8(_) => Ok(DataType::Int8),
+            ScalarValue::Int16(_) => Ok(DataType::Int16),
+            ScalarValue::Int32(_) => Ok(DataType::Int32),
+            ScalarValue::Int64(_) => Ok(DataType::Int64),
+            ScalarValue::Float32(_) => Ok(DataType::Float32),
+            ScalarValue::Float64(_) => Ok(DataType::Float64),
+            ScalarValue::Utf8(_) => Ok(DataType::Utf8),
+            _ => Err(ExecutionError::General(format!(
+                "Cannot treat {:?} as scalar value",
+                self
+            ))),
         }
     }
+}
+
+impl fmt::Display for ScalarValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ScalarValue::Boolean(value) => write!(f, "{}", value),
+            ScalarValue::UInt8(value) => write!(f, "{}", value),
+            ScalarValue::UInt16(value) => write!(f, "{}", value),
+            ScalarValue::UInt32(value) => write!(f, "{}", value),
+            ScalarValue::UInt64(value) => write!(f, "{}", value),
+            ScalarValue::Int8(value) => write!(f, "{}", value),
+            ScalarValue::Int16(value) => write!(f, "{}", value),
+            ScalarValue::Int32(value) => write!(f, "{}", value),
+            ScalarValue::Int64(value) => write!(f, "{}", value),
+            ScalarValue::Float32(value) => write!(f, "{}", value),
+            ScalarValue::Float64(value) => write!(f, "{}", value),
+            ScalarValue::Utf8(value) => write!(f, "{}", value),
+            ScalarValue::Null => write!(f, "NULL"),
+            ScalarValue::Struct(_) => write!(f, "STRUCT"),
+        }
+    }
+}
+
+/// Returns a readable name of an expression based on the input schema.
+/// This function recursively transverses the expression for names such as "CAST(a > 2)".
+fn create_name(e: &Expr, input_schema: &Schema) -> Result<String> {
+    match e {
+        Expr::Alias(_, name) => Ok(name.clone()),
+        Expr::Column(name) => Ok(name.clone()),
+        Expr::Literal(value) => Ok(format!("{:?}", value)),
+        Expr::BinaryExpr { left, op, right } => {
+            let left = create_name(left, input_schema)?;
+            let right = create_name(right, input_schema)?;
+            Ok(format!("{} {:?} {}", left, op, right))
+        }
+        Expr::Cast { expr, data_type } => {
+            let expr = create_name(expr, input_schema)?;
+            Ok(format!("CAST({} as {:?})", expr, data_type))
+        }
+        Expr::ScalarFunction { name, args, .. } => {
+            let mut names = Vec::with_capacity(args.len());
+            for e in args {
+                names.push(create_name(e, input_schema)?);
+            }
+            Ok(format!("{}({})", name, names.join(",")))
+        }
+        Expr::AggregateFunction { name, args, .. } => {
+            let mut names = Vec::with_capacity(args.len());
+            for e in args {
+                names.push(create_name(e, input_schema)?);
+            }
+            Ok(format!("{}({})", name, names.join(",")))
+        }
+        other => Err(ExecutionError::NotImplemented(format!(
+            "Physical plan does not support logical expression {:?}",
+            other
+        ))),
+    }
+}
+
+/// Returns the datatype of the expression given the input schema
+// note: the physical plan derived from an expression must match the datatype on this function.
+pub fn expr_to_field(e: &Expr, input_schema: &Schema) -> Result<Field> {
+    let data_type = e.get_type(input_schema)?;
+    Ok(Field::new(&e.name(input_schema)?, data_type, true))
+}
+
+/// Create field meta-data from an expression, for use in a result set schema
+pub fn exprlist_to_fields(expr: &[Expr], input_schema: &Schema) -> Result<Vec<Field>> {
+    expr.iter()
+        .map(|e| expr_to_field(e, input_schema))
+        .collect()
 }
 
 /// Relation expression
@@ -184,10 +283,8 @@ impl ScalarValue {
 pub enum Expr {
     /// An aliased expression
     Alias(Box<Expr>, String),
-    /// index into a value within the row or complex value
-    Column(usize),
-    /// Reference to column by name
-    UnresolvedColumn(String),
+    /// column of a table scan
+    Column(String),
     /// literal value
     Literal(ScalarValue),
     /// binary expression e.g. "age > 21"
@@ -199,6 +296,8 @@ pub enum Expr {
         /// Right-hand side of the expression
         right: Box<Expr>,
     },
+    /// Nested expression e.g. `(foo > bar)` or `(1)`
+    Nested(Box<Expr>),
     /// unary NOT
     Not(Box<Expr>),
     /// unary IS NOT NULL
@@ -236,8 +335,6 @@ pub enum Expr {
         name: String,
         /// List of expressions to feed to the functions as arguments
         args: Vec<Expr>,
-        /// The `DataType` the expression will yield
-        return_type: DataType,
     },
     /// Wildcard
     Wildcard,
@@ -248,14 +345,52 @@ impl Expr {
     pub fn get_type(&self, schema: &Schema) -> Result<DataType> {
         match self {
             Expr::Alias(expr, _) => expr.get_type(schema),
-            Expr::Column(n) => Ok(schema.field(*n).data_type().clone()),
-            Expr::UnresolvedColumn(name) => {
-                Ok(schema.field_with_name(&name)?.data_type().clone())
-            }
-            Expr::Literal(l) => Ok(l.get_datatype()),
+            Expr::Column(name) => Ok(schema.field_with_name(name)?.data_type().clone()),
+            Expr::Literal(l) => l.get_datatype(),
             Expr::Cast { data_type, .. } => Ok(data_type.clone()),
             Expr::ScalarFunction { return_type, .. } => Ok(return_type.clone()),
-            Expr::AggregateFunction { return_type, .. } => Ok(return_type.clone()),
+            Expr::AggregateFunction { name, args, .. } => {
+                match name.to_uppercase().as_str() {
+                    "MIN" | "MAX" => args[0].get_type(schema),
+                    "SUM" => match args[0].get_type(schema)? {
+                        DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64 => Ok(DataType::Int64),
+                        DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64 => Ok(DataType::UInt64),
+                        DataType::Float32 => Ok(DataType::Float32),
+                        DataType::Float64 => Ok(DataType::Float64),
+                        other => Err(ExecutionError::General(format!(
+                            "SUM does not support {:?}",
+                            other
+                        ))),
+                    },
+                    "AVG" => match args[0].get_type(schema)? {
+                        DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                        | DataType::Float32
+                        | DataType::Float64 => Ok(DataType::Float64),
+                        other => Err(ExecutionError::General(format!(
+                            "AVG does not support {:?}",
+                            other
+                        ))),
+                    },
+                    "COUNT" => Ok(DataType::UInt64),
+                    other => Err(ExecutionError::General(format!(
+                        "Invalid aggregate function '{:?}'",
+                        other
+                    ))),
+                }
+            }
             Expr::Not(_) => Ok(DataType::Boolean),
             Expr::IsNull(_) => Ok(DataType::Boolean),
             Expr::IsNotNull(_) => Ok(DataType::Boolean),
@@ -280,7 +415,15 @@ impl Expr {
             Expr::Wildcard => Err(ExecutionError::General(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
+            Expr::Nested(e) => e.get_type(schema),
         }
+    }
+
+    /// Return the name of this expression
+    ///
+    /// This represents how a column with this expression is named when no alias is chosen
+    pub fn name(&self, input_schema: &Schema) -> Result<String> {
+        create_name(self, input_schema)
     }
 
     /// Perform a type cast on the expression value.
@@ -304,57 +447,43 @@ impl Expr {
     }
 
     /// Equal
-    pub fn eq(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::Eq,
-            right: Box::new(other.clone()),
-        }
+    pub fn eq(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Eq, other.clone())
     }
 
     /// Not equal
-    pub fn not_eq(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::NotEq,
-            right: Box::new(other.clone()),
-        }
+    pub fn not_eq(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::NotEq, other.clone())
     }
 
     /// Greater than
-    pub fn gt(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::Gt,
-            right: Box::new(other.clone()),
-        }
+    pub fn gt(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Gt, other.clone())
     }
 
     /// Greater than or equal to
-    pub fn gt_eq(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::GtEq,
-            right: Box::new(other.clone()),
-        }
+    pub fn gt_eq(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::GtEq, other.clone())
     }
 
     /// Less than
-    pub fn lt(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::Lt,
-            right: Box::new(other.clone()),
-        }
+    pub fn lt(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Lt, other.clone())
     }
 
     /// Less than or equal to
-    pub fn lt_eq(&self, other: &Expr) -> Expr {
-        Expr::BinaryExpr {
-            left: Box::new(self.clone()),
-            op: Operator::LtEq,
-            right: Box::new(other.clone()),
-        }
+    pub fn lt_eq(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::LtEq, other.clone())
+    }
+
+    /// And
+    pub fn and(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::And, other)
+    }
+
+    /// Or
+    pub fn or(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Or, other)
     }
 
     /// Not
@@ -362,25 +491,142 @@ impl Expr {
         Expr::Not(Box::new(self.clone()))
     }
 
+    /// Add the specified expression
+    pub fn plus(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Plus, other.clone())
+    }
+
+    /// Subtract the specified expression
+    pub fn minus(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Minus, other.clone())
+    }
+
+    /// Multiply by the specified expression
+    pub fn multiply(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Multiply, other.clone())
+    }
+
+    /// Divide by the specified expression
+    pub fn divide(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Divide, other.clone())
+    }
+
+    /// Calculate the modulus of two expressions
+    pub fn modulus(&self, other: Expr) -> Expr {
+        binary_expr(self.clone(), Operator::Modulus, other.clone())
+    }
+
     /// Alias
     pub fn alias(&self, name: &str) -> Expr {
         Expr::Alias(Box::new(self.clone()), name.to_owned())
     }
+
+    /// Create a sort expression from an existing expression.
+    ///
+    /// ```
+    /// # use datafusion::logicalplan::col;
+    /// let sort_expr = col("foo").sort(true, true); // SORT ASC NULLS_FIRST
+    /// ```
+    pub fn sort(&self, asc: bool, nulls_first: bool) -> Expr {
+        Expr::Sort {
+            expr: Box::new(self.clone()),
+            asc,
+            nulls_first,
+        }
+    }
 }
 
-/// Create a column expression based on a column index
-pub fn col_index(index: usize) -> Expr {
-    Expr::Column(index)
+fn binary_expr(l: Expr, op: Operator, r: Expr) -> Expr {
+    Expr::BinaryExpr {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+    }
+}
+
+/// return a new expression with a logical AND
+pub fn and(left: &Expr, right: &Expr) -> Expr {
+    Expr::BinaryExpr {
+        left: Box::new(left.clone()),
+        op: Operator::And,
+        right: Box::new(right.clone()),
+    }
 }
 
 /// Create a column expression based on a column name
 pub fn col(name: &str) -> Expr {
-    Expr::UnresolvedColumn(name.to_owned())
+    Expr::Column(name.to_owned())
 }
 
-/// Create a literal string expression
-pub fn lit_str(str: &str) -> Expr {
-    Expr::Literal(ScalarValue::Utf8(str.to_owned()))
+/// Create an expression to represent the min() aggregate function
+pub fn min(expr: Expr) -> Expr {
+    aggregate_expr("MIN", expr)
+}
+
+/// Create an expression to represent the max() aggregate function
+pub fn max(expr: Expr) -> Expr {
+    aggregate_expr("MAX", expr)
+}
+
+/// Create an expression to represent the sum() aggregate function
+pub fn sum(expr: Expr) -> Expr {
+    aggregate_expr("SUM", expr)
+}
+
+/// Create an expression to represent the avg() aggregate function
+pub fn avg(expr: Expr) -> Expr {
+    aggregate_expr("AVG", expr)
+}
+
+/// Create an expression to represent the count() aggregate function
+pub fn count(expr: Expr) -> Expr {
+    aggregate_expr("COUNT", expr)
+}
+
+/// Whether it can be represented as a literal expression
+pub trait Literal {
+    /// convert the value to a Literal expression
+    fn lit(&self) -> Expr;
+}
+
+impl Literal for &str {
+    fn lit(&self) -> Expr {
+        Expr::Literal(ScalarValue::Utf8((*self).to_owned()))
+    }
+}
+
+impl Literal for String {
+    fn lit(&self) -> Expr {
+        Expr::Literal(ScalarValue::Utf8((*self).to_owned()))
+    }
+}
+
+macro_rules! make_literal {
+    ($TYPE:ty, $SCALAR:ident) => {
+        #[allow(missing_docs)]
+        impl Literal for $TYPE {
+            fn lit(&self) -> Expr {
+                Expr::Literal(ScalarValue::$SCALAR(self.clone()))
+            }
+        }
+    };
+}
+
+make_literal!(bool, Boolean);
+make_literal!(f32, Float32);
+make_literal!(f64, Float64);
+make_literal!(i8, Int8);
+make_literal!(i16, Int16);
+make_literal!(i32, Int32);
+make_literal!(i64, Int64);
+make_literal!(u8, UInt8);
+make_literal!(u16, UInt16);
+make_literal!(u32, UInt32);
+make_literal!(u64, UInt64);
+
+/// Create a literal expression
+pub fn lit<T: Literal>(n: T) -> Expr {
+    n.lit()
 }
 
 /// Create an convenience function representing a unary scalar function
@@ -412,12 +658,16 @@ unary_math_expr!("log", ln);
 unary_math_expr!("log2", log2);
 unary_math_expr!("log10", log10);
 
+/// returns the length of a string in bytes
+pub fn length(e: Expr) -> Expr {
+    scalar_function("length", vec![e], DataType::UInt32)
+}
+
 /// Create an aggregate expression
-pub fn aggregate_expr(name: &str, expr: Expr, return_type: DataType) -> Expr {
+pub fn aggregate_expr(name: &str, expr: Expr) -> Expr {
     Expr::AggregateFunction {
         name: name.to_owned(),
         args: vec![expr],
-        return_type,
     }
 }
 
@@ -434,8 +684,7 @@ impl fmt::Debug for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Expr::Alias(expr, alias) => write!(f, "{:?} AS {}", expr, alias),
-            Expr::Column(i) => write!(f, "#{}", i),
-            Expr::UnresolvedColumn(name) => write!(f, "#{}", name),
+            Expr::Column(name) => write!(f, "#{}", name),
             Expr::Literal(v) => write!(f, "{:?}", v),
             Expr::Cast { expr, data_type } => {
                 write!(f, "CAST({:?} AS {:?})", expr, data_type)
@@ -485,51 +734,60 @@ impl fmt::Debug for Expr {
                 write!(f, ")")
             }
             Expr::Wildcard => write!(f, "*"),
+            Expr::Nested(expr) => write!(f, "({:?})", expr),
         }
     }
 }
 
 /// The LogicalPlan represents different types of relations (such as Projection,
-/// Selection, etc) and can be created by the SQL query planner and the DataFrame API.
+/// Filter, etc) and can be created by the SQL query planner and the DataFrame API.
 #[derive(Clone)]
 pub enum LogicalPlan {
-    /// A Projection (essentially a SELECT with an expression list)
+    /// Evaluates an arbitrary list of expressions (essentially a
+    /// SELECT with an expression list) on its input.
     Projection {
         /// The list of expressions
         expr: Vec<Expr>,
-        /// The incoming logic plan
+        /// The incoming logical plan
         input: Box<LogicalPlan>,
-        /// The schema description
+        /// The schema description of the output
         schema: Box<Schema>,
     },
-    /// A Selection (essentially a WHERE clause with a predicate expression)
-    Selection {
-        /// The expression
-        expr: Expr,
-        /// The incoming logic plan
+    /// Filters rows from its input that do not match an
+    /// expression (essentially a WHERE clause with a predicate
+    /// expression).
+    ///
+    /// Semantically, `<predicate>` is evaluated for each row of the input;
+    /// If the value of `<predicate>` is true, the input row is passed to
+    /// the output. If the value of `<predicate>` is false, the row is
+    /// discarded.
+    Filter {
+        /// The predicate expression, which must have Boolean type.
+        predicate: Expr,
+        /// The incoming logical plan
         input: Box<LogicalPlan>,
     },
-    /// Represents a list of aggregate expressions with optional grouping expressions
+    /// Aggregates its input based on a set of grouping and aggregate
+    /// expressions (e.g. SUM).
     Aggregate {
-        /// The incoming logic plan
+        /// The incoming logical plan
         input: Box<LogicalPlan>,
         /// Grouping expressions
         group_expr: Vec<Expr>,
         /// Aggregate expressions
         aggr_expr: Vec<Expr>,
-        /// The schema description
+        /// The schema description of the aggregate output
         schema: Box<Schema>,
     },
-    /// Represents a list of sort expressions to be applied to a relation
+    /// Sorts its input according to a list of sort expressions.
     Sort {
         /// The sort expressions
         expr: Vec<Expr>,
-        /// The incoming logic plan
+        /// The incoming logical plan
         input: Box<LogicalPlan>,
-        /// The schema description
-        schema: Box<Schema>,
     },
-    /// A table scan against a table that has been registered on a context
+    /// Produces rows from a table that has been registered on a
+    /// context
     TableScan {
         /// The name of the schema
         schema_name: String,
@@ -539,10 +797,10 @@ pub enum LogicalPlan {
         table_schema: Box<Schema>,
         /// Optional column indices to use as a projection
         projection: Option<Vec<usize>>,
-        /// The projected schema
+        /// The schema description of the output
         projected_schema: Box<Schema>,
     },
-    /// A table scan against a vector of record batches
+    /// Produces rows that come from a `Vec` of in memory `RecordBatch`es
     InMemoryScan {
         /// Record batch partitions
         data: Vec<Vec<RecordBatch>>,
@@ -550,10 +808,10 @@ pub enum LogicalPlan {
         schema: Box<Schema>,
         /// Optional column indices to use as a projection
         projection: Option<Vec<usize>>,
-        /// The projected schema
+        /// The schema description of the output
         projected_schema: Box<Schema>,
     },
-    /// A table scan against a Parquet data source
+    /// Produces rows by scanning Parquet file(s)
     ParquetScan {
         /// The path to the files
         path: String,
@@ -561,10 +819,10 @@ pub enum LogicalPlan {
         schema: Box<Schema>,
         /// Optional column indices to use as a projection
         projection: Option<Vec<usize>>,
-        /// The projected schema
+        /// The schema description of the output
         projected_schema: Box<Schema>,
     },
-    /// A table scan against a CSV data source
+    /// Produces rows by scanning a CSV file(s)
     CsvScan {
         /// The path to the files
         path: String,
@@ -576,24 +834,22 @@ pub enum LogicalPlan {
         delimiter: Option<u8>,
         /// Optional column indices to use as a projection
         projection: Option<Vec<usize>>,
-        /// The projected schema
+        /// The schema description of the output
         projected_schema: Box<Schema>,
     },
-    /// An empty relation with an empty schema
+    /// Produces no rows: An empty relation with an empty schema
     EmptyRelation {
-        /// The schema description
+        /// The schema description of the output
         schema: Box<Schema>,
     },
-    /// Represents the maximum number of records to return
+    /// Produces the first `n` tuples from its input and discards the rest.
     Limit {
         /// The limit
         n: usize,
         /// The logical plan
         input: Box<LogicalPlan>,
-        /// The schema description
-        schema: Box<Schema>,
     },
-    /// Represents a create external table expression.
+    /// Creates an external table.
     CreateExternalTable {
         /// The table schema
         schema: Box<Schema>,
@@ -605,6 +861,18 @@ pub enum LogicalPlan {
         file_type: FileType,
         /// Whether the CSV file contains a header
         has_header: bool,
+    },
+    /// Produces a relation with string representations of
+    /// various parts of the plan
+    Explain {
+        /// Should extra (detailed, intermediate plans) be included?
+        verbose: bool,
+        /// The logical plan that is being EXPLAIN'd
+        plan: Box<LogicalPlan>,
+        /// Represent the various stages plans have gone through
+        stringified_plans: Vec<StringifiedPlan>,
+        /// The output schema of the explain (2 columns of text)
+        schema: Box<Schema>,
     },
 }
 
@@ -626,12 +894,21 @@ impl LogicalPlan {
                 projected_schema, ..
             } => &projected_schema,
             LogicalPlan::Projection { schema, .. } => &schema,
-            LogicalPlan::Selection { input, .. } => input.schema(),
+            LogicalPlan::Filter { input, .. } => input.schema(),
             LogicalPlan::Aggregate { schema, .. } => &schema,
-            LogicalPlan::Sort { schema, .. } => &schema,
-            LogicalPlan::Limit { schema, .. } => &schema,
+            LogicalPlan::Sort { input, .. } => input.schema(),
+            LogicalPlan::Limit { input, .. } => input.schema(),
             LogicalPlan::CreateExternalTable { schema, .. } => &schema,
+            LogicalPlan::Explain { schema, .. } => &schema,
         }
+    }
+
+    /// Returns the (fixed) output schema for explain plans
+    pub fn explain_schema() -> Box<Schema> {
+        Box::new(Schema::new(vec![
+            Field::new("plan_type", DataType::Utf8, false),
+            Field::new("plan", DataType::Utf8, false),
+        ]))
     }
 }
 
@@ -677,12 +954,12 @@ impl LogicalPlan {
                 }
                 input.fmt_with_indent(f, indent + 1)
             }
-            LogicalPlan::Selection {
-                ref expr,
+            LogicalPlan::Filter {
+                predicate: ref expr,
                 ref input,
                 ..
             } => {
-                write!(f, "Selection: {:?}", expr)?;
+                write!(f, "Filter: {:?}", expr)?;
                 input.fmt_with_indent(f, indent + 1)
             }
             LogicalPlan::Aggregate {
@@ -720,6 +997,10 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateExternalTable { ref name, .. } => {
                 write!(f, "CreateExternalTable: {:?}", name)
+            }
+            LogicalPlan::Explain { ref plan, .. } => {
+                write!(f, "Explain")?;
+                plan.fmt_with_indent(f, indent + 1)
             }
         }
     }
@@ -884,7 +1165,7 @@ impl LogicalPlanBuilder {
             (0..expr.len()).for_each(|i| match &expr[i] {
                 Expr::Wildcard => {
                     (0..input_schema.fields().len())
-                        .for_each(|i| expr_vec.push(col_index(i).clone()));
+                        .for_each(|i| expr_vec.push(col(input_schema.field(i).name())));
                 }
                 _ => expr_vec.push(expr[i].clone()),
             });
@@ -893,10 +1174,8 @@ impl LogicalPlanBuilder {
             expr.clone()
         };
 
-        let schema = Schema::new(utils::exprlist_to_fields(
-            &projected_expr,
-            input_schema.as_ref(),
-        )?);
+        let schema =
+            Schema::new(exprlist_to_fields(&projected_expr, input_schema.as_ref())?);
 
         Ok(Self::from(&LogicalPlan::Projection {
             expr: projected_expr,
@@ -907,8 +1186,8 @@ impl LogicalPlanBuilder {
 
     /// Apply a filter
     pub fn filter(&self, expr: Expr) -> Result<Self> {
-        Ok(Self::from(&LogicalPlan::Selection {
-            expr,
+        Ok(Self::from(&LogicalPlan::Filter {
+            predicate: expr,
             input: Box::new(self.plan.clone()),
         }))
     }
@@ -918,7 +1197,6 @@ impl LogicalPlanBuilder {
         Ok(Self::from(&LogicalPlan::Limit {
             n,
             input: Box::new(self.plan.clone()),
-            schema: self.plan.schema().clone(),
         }))
     }
 
@@ -927,17 +1205,15 @@ impl LogicalPlanBuilder {
         Ok(Self::from(&LogicalPlan::Sort {
             expr,
             input: Box::new(self.plan.clone()),
-            schema: self.plan.schema().clone(),
         }))
     }
 
     /// Apply an aggregate
     pub fn aggregate(&self, group_expr: Vec<Expr>, aggr_expr: Vec<Expr>) -> Result<Self> {
-        let mut all_fields: Vec<Expr> = group_expr.clone();
-        aggr_expr.iter().for_each(|x| all_fields.push(x.clone()));
+        let mut all_expr: Vec<Expr> = group_expr.clone();
+        aggr_expr.iter().for_each(|x| all_expr.push(x.clone()));
 
-        let aggr_schema =
-            Schema::new(utils::exprlist_to_fields(&all_fields, self.plan.schema())?);
+        let aggr_schema = Schema::new(exprlist_to_fields(&all_expr, self.plan.schema())?);
 
         Ok(Self::from(&LogicalPlan::Aggregate {
             input: Box::new(self.plan.clone()),
@@ -953,6 +1229,58 @@ impl LogicalPlanBuilder {
     }
 }
 
+/// Represents which type of plan
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanType {
+    /// The initial LogicalPlan provided to DataFusion
+    LogicalPlan,
+    /// The LogicalPlan which results from applying an optimizer pass
+    OptimizedLogicalPlan {
+        /// The name of the optimizer which produced this plan
+        optimizer_name: String,
+    },
+    /// The physical plan, prepared for execution
+    PhysicalPlan,
+}
+
+impl From<&PlanType> for String {
+    fn from(t: &PlanType) -> Self {
+        match t {
+            PlanType::LogicalPlan => "logical_plan".into(),
+            PlanType::OptimizedLogicalPlan { optimizer_name } => {
+                format!("logical_plan after {}", optimizer_name)
+            }
+            PlanType::PhysicalPlan => "physical_plan".into(),
+        }
+    }
+}
+
+/// Represents some sort of execution plan, in String form
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringifiedPlan {
+    /// An identifier of what type of plan this string represents
+    pub plan_type: PlanType,
+    /// The string representation of the plan
+    pub plan: Arc<String>,
+}
+
+impl StringifiedPlan {
+    /// Create a new Stringified plan of `plan_type` with string
+    /// representation `plan`
+    pub fn new(plan_type: PlanType, plan: impl Into<String>) -> Self {
+        StringifiedPlan {
+            plan_type,
+            plan: Arc::new(plan.into()),
+        }
+    }
+
+    /// returns true if this plan should be displayed. Generally
+    /// `verbose_mode = true` will display all available plans
+    pub fn should_display(&self, verbose_mode: bool) -> bool {
+        self.plan_type == PlanType::LogicalPlan || verbose_mode
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,12 +1293,12 @@ mod tests {
             &employee_schema(),
             Some(vec![0, 3]),
         )?
-        .filter(col("state").eq(&lit_str("CO")))?
+        .filter(col("state").eq(lit("CO")))?
         .project(vec![col("id")])?
         .build()?;
 
         let expected = "Projection: #id\
-        \n  Selection: #state Eq Utf8(\"CO\")\
+        \n  Filter: #state Eq Utf8(\"CO\")\
         \n    TableScan: employee.csv projection=Some([0, 3])";
 
         assert_eq!(expected, format!("{:?}", plan));
@@ -985,12 +1313,12 @@ mod tests {
             CsvReadOptions::new().schema(&employee_schema()),
             Some(vec![0, 3]),
         )?
-        .filter(col("state").eq(&lit_str("CO")))?
+        .filter(col("state").eq(lit("CO")))?
         .project(vec![col("id")])?
         .build()?;
 
         let expected = "Projection: #id\
-        \n  Selection: #state Eq Utf8(\"CO\")\
+        \n  Filter: #state Eq Utf8(\"CO\")\
         \n    CsvScan: employee.csv projection=Some([0, 3])";
 
         assert_eq!(expected, format!("{:?}", plan));
@@ -1008,8 +1336,7 @@ mod tests {
         )?
         .aggregate(
             vec![col("state")],
-            vec![aggregate_expr("SUM", col("salary"), DataType::Int32)
-                .alias("total_salary")],
+            vec![aggregate_expr("SUM", col("salary")).alias("total_salary")],
         )?
         .project(vec![col("state"), col("total_salary")])?
         .build()?;
@@ -1023,6 +1350,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     #[test]
     fn plan_builder_sort() -> Result<()> {
         let plan = LogicalPlanBuilder::scan(
@@ -1061,5 +1389,29 @@ mod tests {
             Field::new("state", DataType::Utf8, false),
             Field::new("salary", DataType::Int32, false),
         ])
+    }
+
+    #[test]
+    fn stringified_plan() -> Result<()> {
+        let stringified_plan =
+            StringifiedPlan::new(PlanType::LogicalPlan, "...the plan...");
+        assert!(stringified_plan.should_display(true));
+        assert!(stringified_plan.should_display(false)); // display in non verbose mode too
+
+        let stringified_plan =
+            StringifiedPlan::new(PlanType::PhysicalPlan, "...the plan...");
+        assert!(stringified_plan.should_display(true));
+        assert!(!stringified_plan.should_display(false));
+
+        let stringified_plan = StringifiedPlan::new(
+            PlanType::OptimizedLogicalPlan {
+                optimizer_name: "random opt pass".into(),
+            },
+            "...the plan...",
+        );
+        assert!(stringified_plan.should_display(true));
+        assert!(!stringified_plan.should_display(false));
+
+        Ok(())
     }
 }
