@@ -49,6 +49,7 @@
 #include "arrow/type.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
 
 #include "generated/Message_generated.h"  // IWYU pragma: keep
@@ -57,8 +58,12 @@ namespace arrow {
 
 using internal::checked_cast;
 using internal::GetByteWidth;
+using internal::TemporaryDir;
 
 namespace ipc {
+
+using internal::FieldPosition;
+
 namespace test {
 
 using BatchVector = std::vector<std::shared_ptr<RecordBatch>>;
@@ -223,11 +228,10 @@ class TestSchemaMetadata : public ::testing::Test {
   void SetUp() {}
 
   void CheckSchemaRoundtrip(const Schema& schema) {
-    DictionaryMemo in_memo, out_memo;
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Buffer> buffer,
-                         SerializeSchema(schema, &out_memo, default_memory_pool()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Buffer> buffer, SerializeSchema(schema));
 
     io::BufferReader reader(buffer);
+    DictionaryMemo in_memo;
     ASSERT_OK_AND_ASSIGN(auto actual_schema, ReadSchema(&reader, &in_memo));
     AssertSchemaEqual(schema, *actual_schema);
   }
@@ -334,6 +338,7 @@ TEST_F(TestSchemaMetadata, MetadataVersionForwardCompatibility) {
 const std::vector<test::MakeRecordBatch*> kBatchCases = {
     &MakeIntRecordBatch,
     &MakeListRecordBatch,
+    &MakeFixedSizeListRecordBatch,
     &MakeNonNullRecordBatch,
     &MakeZeroLengthRecordBatch,
     &MakeDeeplyNestedList,
@@ -342,6 +347,8 @@ const std::vector<test::MakeRecordBatch*> kBatchCases = {
     &MakeUnion,
     &MakeDictionary,
     &MakeNestedDictionary,
+    &MakeMap,
+    &MakeMapOfDictionary,
     &MakeDates,
     &MakeTimestamps,
     &MakeTimes,
@@ -370,17 +377,22 @@ class ExtensionTypesMixin {
 
 class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
  public:
-  void SetUp() { options_ = IpcWriteOptions::Defaults(); }
+  void SetUp() {
+    options_ = IpcWriteOptions::Defaults();
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("ipc-test-"));
+  }
 
-  void DoSchemaRoundTrip(const Schema& schema, DictionaryMemo* out_memo,
-                         std::shared_ptr<Schema>* result) {
+  std::string TempFile(util::string_view file) {
+    return temp_dir_->path().Join(std::string(file)).ValueOrDie().ToString();
+  }
+
+  void DoSchemaRoundTrip(const Schema& schema, std::shared_ptr<Schema>* result) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Buffer> serialized_schema,
-                         SerializeSchema(schema, out_memo, options_.memory_pool));
+                         SerializeSchema(schema, options_.memory_pool));
 
     DictionaryMemo in_memo;
     io::BufferReader buf_reader(serialized_schema);
     ASSERT_OK_AND_ASSIGN(*result, ReadSchema(&buf_reader, &in_memo));
-    ASSERT_EQ(out_memo->num_fields(), in_memo.num_fields());
   }
 
   Result<std::shared_ptr<RecordBatch>> DoStandardRoundTrip(
@@ -405,7 +417,7 @@ class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
     options.allow_64bit = true;
 
     ARROW_ASSIGN_OR_RAISE(auto file_writer,
-                          NewFileWriter(mmap_.get(), batch.schema(), options));
+                          MakeFileWriter(mmap_, batch.schema(), options));
     RETURN_NOT_OK(file_writer->WriteRecordBatch(batch));
     RETURN_NOT_OK(file_writer->Close());
 
@@ -434,16 +446,15 @@ class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
                       int64_t buffer_size = 1 << 20) {
     std::stringstream ss;
     ss << "test-write-row-batch-" << g_file_number++;
-    ASSERT_OK_AND_ASSIGN(mmap_,
-                         io::MemoryMapFixture::InitMemoryMap(buffer_size, ss.str()));
-
-    DictionaryMemo dictionary_memo;
+    ASSERT_OK_AND_ASSIGN(
+        mmap_, io::MemoryMapFixture::InitMemoryMap(buffer_size, TempFile(ss.str())));
 
     std::shared_ptr<Schema> schema_result;
-    DoSchemaRoundTrip(*batch.schema(), &dictionary_memo, &schema_result);
+    DoSchemaRoundTrip(*batch.schema(), &schema_result);
     ASSERT_TRUE(batch.schema()->Equals(*schema_result));
 
-    ASSERT_OK(CollectDictionaries(batch, &dictionary_memo));
+    DictionaryMemo dictionary_memo;
+    ASSERT_OK(::arrow::ipc::internal::CollectDictionaries(batch, &dictionary_memo));
 
     ASSERT_OK_AND_ASSIGN(
         auto result, DoStandardRoundTrip(batch, options, &dictionary_memo, read_options));
@@ -467,6 +478,7 @@ class IpcTestFixture : public io::MemoryMapFixture, public ExtensionTypesMixin {
  protected:
   std::shared_ptr<io::MemoryMappedFile> mmap_;
   IpcWriteOptions options_;
+  std::unique_ptr<TemporaryDir> temp_dir_;
 };
 
 TEST(MetadataVersion, ForwardsCompatCheck) {
@@ -642,10 +654,9 @@ TEST_F(TestWriteRecordBatch, SliceTruncatesBinaryOffsets) {
   auto batch = RecordBatch::Make(schema, array->length(), {array});
   auto sliced_batch = batch->Slice(0, 5);
 
-  std::stringstream ss;
-  ss << "test-truncate-offsets";
   ASSERT_OK_AND_ASSIGN(
-      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20, ss.str()));
+      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20,
+                                                 TempFile("test-truncate-offsets")));
   DictionaryMemo dictionary_memo;
   ASSERT_OK_AND_ASSIGN(
       auto result,
@@ -730,10 +741,9 @@ TEST_F(TestWriteRecordBatch, RoundtripPreservesBufferSizes) {
   auto arr = rg.String(length, 0, 10, 0.1);
   auto batch = RecordBatch::Make(::arrow::schema({field("f0", utf8())}), length, {arr});
 
-  std::stringstream ss;
-  ss << "test-roundtrip-buffer-sizes";
   ASSERT_OK_AND_ASSIGN(
-      mmap_, io::MemoryMapFixture::InitMemoryMap(/*buffer_size=*/1 << 20, ss.str()));
+      mmap_, io::MemoryMapFixture::InitMemoryMap(
+                 /*buffer_size=*/1 << 20, TempFile("test-roundtrip-buffer-sizes")));
   DictionaryMemo dictionary_memo;
   ASSERT_OK_AND_ASSIGN(
       auto result,
@@ -785,7 +795,15 @@ TEST_F(TestWriteRecordBatch, IntegerGetRecordBatchSize) {
 
 class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
  public:
-  void SetUp() { pool_ = default_memory_pool(); }
+  void SetUp() {
+    pool_ = default_memory_pool();
+    ASSERT_OK_AND_ASSIGN(temp_dir_, TemporaryDir::Make("ipc-recursion-limits-test-"));
+  }
+
+  std::string TempFile(util::string_view file) {
+    return temp_dir_->path().Join(std::string(file)).ValueOrDie().ToString();
+  }
+
   void TearDown() { io::MemoryMapFixture::TearDown(); }
 
   Status WriteToMmap(int recursion_level, bool override_level, int32_t* metadata_length,
@@ -811,8 +829,8 @@ class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
     std::stringstream ss;
     ss << "test-write-past-max-recursion-" << g_file_number++;
     const int memory_map_size = 1 << 20;
-    ARROW_ASSIGN_OR_RAISE(mmap_,
-                          io::MemoryMapFixture::InitMemoryMap(memory_map_size, ss.str()));
+    ARROW_ASSIGN_OR_RAISE(
+        mmap_, io::MemoryMapFixture::InitMemoryMap(memory_map_size, TempFile(ss.str())));
 
     auto options = IpcWriteOptions::Defaults();
     if (override_level) {
@@ -824,6 +842,7 @@ class RecursionLimits : public ::testing::Test, public io::MemoryMapFixture {
 
  protected:
   std::shared_ptr<io::MemoryMappedFile> mmap_;
+  std::unique_ptr<TemporaryDir> temp_dir_;
   MemoryPool* pool_;
 };
 
@@ -901,7 +920,8 @@ struct FileWriterHelper {
 
     ARROW_ASSIGN_OR_RAISE(buffer_, AllocateResizableBuffer(0));
     sink_.reset(new io::BufferOutputStream(buffer_));
-    ARROW_ASSIGN_OR_RAISE(writer_, NewFileWriter(sink_.get(), schema, options, metadata));
+    ARROW_ASSIGN_OR_RAISE(writer_,
+                          MakeFileWriter(sink_.get(), schema, options, metadata));
     return Status::OK();
   }
 
@@ -966,7 +986,7 @@ struct StreamWriterHelper {
   Status Init(const std::shared_ptr<Schema>& schema, const IpcWriteOptions& options) {
     ARROW_ASSIGN_OR_RAISE(buffer_, AllocateResizableBuffer(0));
     sink_.reset(new io::BufferOutputStream(buffer_));
-    ARROW_ASSIGN_OR_RAISE(writer_, NewStreamWriter(sink_.get(), schema, options));
+    ARROW_ASSIGN_OR_RAISE(writer_, MakeStreamWriter(sink_.get(), schema, options));
     return Status::OK();
   }
 
@@ -1333,8 +1353,9 @@ class DictionaryBatchHelper {
 
     // write schema
     IpcPayload payload;
-    RETURN_NOT_OK(GetSchemaPayload(schema_, IpcWriteOptions::Defaults(),
-                                   &dictionary_memo_, &payload));
+    DictionaryFieldMapper mapper(schema_);
+    RETURN_NOT_OK(
+        GetSchemaPayload(schema_, IpcWriteOptions::Defaults(), mapper, &payload));
     return payload_writer_->WritePayload(payload);
   }
 
@@ -1369,7 +1390,6 @@ class DictionaryBatchHelper {
 
   std::unique_ptr<internal::IpcPayloadWriter> payload_writer_;
   const Schema& schema_;
-  DictionaryMemo dictionary_memo_;
   std::shared_ptr<ResizableBuffer> buffer_;
   std::unique_ptr<io::BufferOutputStream> sink_;
 };
@@ -1587,7 +1607,7 @@ TEST(TestRecordBatchStreamReader, EmptyStreamWithDictionaries) {
 
   ASSERT_OK_AND_ASSIGN(auto stream, io::BufferOutputStream::Create(0));
 
-  ASSERT_OK_AND_ASSIGN(auto writer, NewStreamWriter(stream.get(), schema));
+  ASSERT_OK_AND_ASSIGN(auto writer, MakeStreamWriter(stream, schema));
   ASSERT_OK(writer->Close());
 
   ASSERT_OK_AND_ASSIGN(auto buffer, stream->Finish());
@@ -1644,7 +1664,7 @@ TEST(TestRecordBatchStreamReader, NotEnoughDictionaries) {
   ASSERT_OK(MakeDictionaryFlat(&batch));
 
   ASSERT_OK_AND_ASSIGN(auto out, io::BufferOutputStream::Create(0));
-  ASSERT_OK_AND_ASSIGN(auto writer, NewStreamWriter(out.get(), batch->schema()));
+  ASSERT_OK_AND_ASSIGN(auto writer, MakeStreamWriter(out, batch->schema()));
   ASSERT_OK(writer->WriteRecordBatch(*batch));
   ASSERT_OK(writer->Close());
 
@@ -2145,41 +2165,106 @@ TEST(TestStreamDecoder, NextRequiredSize) {
 }
 
 // ----------------------------------------------------------------------
-// DictionaryMemo miscellanea
+// Miscellanea
 
-TEST(TestDictionaryMemo, ReusedDictionaries) {
+TEST(FieldPosition, Basics) {
+  FieldPosition pos;
+  ASSERT_EQ(pos.path(), std::vector<int>{});
+  {
+    auto child = pos.child(6);
+    ASSERT_EQ(child.path(), std::vector<int>{6});
+    auto grand_child = child.child(42);
+    ASSERT_EQ(grand_child.path(), (std::vector<int>{6, 42}));
+  }
+  {
+    auto child = pos.child(12);
+    ASSERT_EQ(child.path(), std::vector<int>{12});
+  }
+}
+
+TEST(DictionaryFieldMapper, Basics) {
+  DictionaryFieldMapper mapper;
+
+  ASSERT_EQ(mapper.num_fields(), 0);
+
+  ASSERT_OK(mapper.AddField(42, {0, 1}));
+  ASSERT_OK(mapper.AddField(43, {0, 2}));
+  ASSERT_OK(mapper.AddField(44, {0, 1, 3}));
+  ASSERT_EQ(mapper.num_fields(), 3);
+
+  ASSERT_OK_AND_EQ(42, mapper.GetFieldId({0, 1}));
+  ASSERT_OK_AND_EQ(43, mapper.GetFieldId({0, 2}));
+  ASSERT_OK_AND_EQ(44, mapper.GetFieldId({0, 1, 3}));
+  ASSERT_RAISES(KeyError, mapper.GetFieldId({}));
+  ASSERT_RAISES(KeyError, mapper.GetFieldId({0}));
+  ASSERT_RAISES(KeyError, mapper.GetFieldId({0, 1, 2}));
+  ASSERT_RAISES(KeyError, mapper.GetFieldId({1}));
+
+  ASSERT_OK(mapper.AddField(41, {}));
+  ASSERT_EQ(mapper.num_fields(), 4);
+  ASSERT_OK_AND_EQ(41, mapper.GetFieldId({}));
+  ASSERT_OK_AND_EQ(42, mapper.GetFieldId({0, 1}));
+
+  // Duplicated dictionary ids are allowed
+  ASSERT_OK(mapper.AddField(42, {4, 5, 6}));
+  ASSERT_EQ(mapper.num_fields(), 5);
+  ASSERT_OK_AND_EQ(42, mapper.GetFieldId({0, 1}));
+  ASSERT_OK_AND_EQ(42, mapper.GetFieldId({4, 5, 6}));
+
+  // Duplicated fields paths are not
+  ASSERT_RAISES(KeyError, mapper.AddField(46, {0, 1}));
+}
+
+TEST(DictionaryFieldMapper, FromSchema) {
+  auto f0 = field("f0", int8());
+  auto f1 =
+      field("f1", struct_({field("a", null()), field("b", dictionary(int8(), utf8()))}));
+  auto f2 = field("f2", dictionary(int32(), list(dictionary(int8(), utf8()))));
+
+  Schema schema({f0, f1, f2});
+  DictionaryFieldMapper mapper(schema);
+
+  ASSERT_EQ(mapper.num_fields(), 3);
+  std::unordered_set<int64_t> ids;
+  for (const auto& path : std::vector<std::vector<int>>{{1, 1}, {2}, {2, 0}}) {
+    ASSERT_OK_AND_ASSIGN(const int64_t id, mapper.GetFieldId(path));
+    ids.insert(id);
+  }
+  ASSERT_EQ(ids.size(), 3);  // All ids are distinct
+}
+
+static void AssertMemoDictionaryType(const DictionaryMemo& memo, int64_t id,
+                                     const std::shared_ptr<DataType>& expected) {
+  ASSERT_OK_AND_ASSIGN(const auto actual, memo.GetDictionaryType(id));
+  AssertTypeEqual(*expected, *actual);
+}
+
+TEST(DictionaryMemo, AddDictionaryType) {
   DictionaryMemo memo;
+  std::shared_ptr<DataType> type;
 
-  std::shared_ptr<Field> field1 = field("a", dictionary(int8(), utf8()));
-  std::shared_ptr<Field> field2 = field("b", dictionary(int16(), utf8()));
+  ASSERT_RAISES(KeyError, memo.GetDictionaryType(42));
 
-  // Two fields referencing the same dictionary_id
-  int64_t dictionary_id = 0;
-  auto dict = ArrayFromJSON(utf8(), "[\"foo\", \"bar\", \"baz\"]");
+  ASSERT_OK(memo.AddDictionaryType(42, utf8()));
+  ASSERT_OK(memo.AddDictionaryType(43, large_binary()));
+  AssertMemoDictionaryType(memo, 42, utf8());
+  AssertMemoDictionaryType(memo, 43, large_binary());
 
-  ASSERT_OK(memo.AddField(dictionary_id, field1));
-  ASSERT_OK(memo.AddField(dictionary_id, field2));
+  // Re-adding same type with different id
+  ASSERT_OK(memo.AddDictionaryType(44, utf8()));
+  AssertMemoDictionaryType(memo, 42, utf8());
+  AssertMemoDictionaryType(memo, 44, utf8());
 
-  std::shared_ptr<DataType> value_type;
-  ASSERT_OK(memo.GetDictionaryType(dictionary_id, &value_type));
-  ASSERT_TRUE(value_type->Equals(*utf8()));
+  // Re-adding same type with same id
+  ASSERT_OK(memo.AddDictionaryType(42, utf8()));
+  AssertMemoDictionaryType(memo, 42, utf8());
+  AssertMemoDictionaryType(memo, 44, utf8());
 
-  ASSERT_FALSE(memo.HasDictionary(dictionary_id));
-  ASSERT_OK(memo.AddDictionary(dictionary_id, dict));
-  ASSERT_TRUE(memo.HasDictionary(dictionary_id));
-
-  ASSERT_EQ(2, memo.num_fields());
-  ASSERT_EQ(1, memo.num_dictionaries());
-
-  ASSERT_TRUE(memo.HasDictionary(*field1));
-  ASSERT_TRUE(memo.HasDictionary(*field2));
-
-  int64_t returned_id = -1;
-  ASSERT_OK(memo.GetId(field1.get(), &returned_id));
-  ASSERT_EQ(0, returned_id);
-  returned_id = -1;
-  ASSERT_OK(memo.GetId(field2.get(), &returned_id));
-  ASSERT_EQ(0, returned_id);
+  // Trying to add different type with same id
+  ASSERT_RAISES(KeyError, memo.AddDictionaryType(42, large_utf8()));
+  AssertMemoDictionaryType(memo, 42, utf8());
+  AssertMemoDictionaryType(memo, 43, large_binary());
+  AssertMemoDictionaryType(memo, 44, utf8());
 }
 
 }  // namespace test

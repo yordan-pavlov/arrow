@@ -1497,6 +1497,22 @@ class TestConvertStringLikeTypes:
         table = pa.Table.from_pandas(df)
         assert table[0].num_chunks == 2
 
+    @pytest.mark.large_memory
+    @pytest.mark.parametrize('char', ['x', b'x'])
+    def test_auto_chunking_pandas_series_of_strings(self, char):
+        # ARROW-2367
+        v1 = char * 100000000
+        v2 = char * 147483646
+
+        df = pd.DataFrame({
+            'strings': [[v1]] * 20 + [[v2]] + [[b'x']]
+        })
+        arr = pa.array(df['strings'], from_pandas=True)
+        assert isinstance(arr, pa.ChunkedArray)
+        assert arr.num_chunks == 2
+        assert len(arr.chunk(0)) == 21
+        assert len(arr.chunk(1)) == 1
+
     def test_fixed_size_bytes(self):
         values = [b'foo', None, bytearray(b'bar'), None, None, b'hey']
         df = pd.DataFrame({'strings': values})
@@ -2087,6 +2103,22 @@ class TestConvertListTypes:
                 s, pd.Series([["aa", "bb"], None, ["cc"], []]),
                 check_names=False)
 
+    @pytest.mark.slow
+    @pytest.mark.large_memory
+    def test_auto_chunking_on_list_overflow(self):
+        # ARROW-9976
+        n = 2**24
+        df = pd.DataFrame.from_dict({
+            "a": list(np.zeros((n, 2**7), dtype='uint8')),
+            "b": range(n)
+        })
+        table = pa.Table.from_pandas(df)
+
+        column_a = table[0]
+        assert column_a.num_chunks == 2
+        assert len(column_a.chunk(0)) == 2**24 - 1
+        assert len(column_a.chunk(1)) == 1
+
 
 class TestConvertStructTypes:
     """
@@ -2447,19 +2479,22 @@ class TestConvertMisc:
             expected = pd.DataFrame({'a': expected})
             tm.assert_frame_equal(result, expected)
 
-    def test_mixed_types_fails(self):
-        data = pd.DataFrame({'a': ['a', 1, 2.0]})
-        with pytest.raises(pa.ArrowTypeError):
-            pa.Table.from_pandas(data)
-
-        data = pd.DataFrame({'a': [1, True]})
-        with pytest.raises(pa.ArrowTypeError):
-            pa.Table.from_pandas(data)
-
-        data = pd.DataFrame({'a': ['a', 1, 2.0]})
-        expected_msg = 'Conversion failed for column a'
-        with pytest.raises(pa.ArrowTypeError, match=expected_msg):
-            pa.Table.from_pandas(data)
+    @pytest.mark.parametrize(
+        "data,error_type",
+        [
+            ({"a": ["a", 1, 2.0]}, pa.ArrowTypeError),
+            ({"a": ["a", 1, 2.0]}, pa.ArrowTypeError),
+            ({"a": [1, True]}, pa.ArrowTypeError),
+            ({"a": [True, "a"]}, pa.ArrowInvalid),
+            ({"a": [1, "a"]}, pa.ArrowInvalid),
+            ({"a": [1.0, "a"]}, pa.ArrowInvalid),
+        ],
+    )
+    def test_mixed_types_fails(self, data, error_type):
+        df = pd.DataFrame(data)
+        msg = "Conversion failed for column a with type object"
+        with pytest.raises(error_type, match=msg):
+            pa.Table.from_pandas(df)
 
     def test_strided_data_import(self):
         cases = []
@@ -3531,11 +3566,10 @@ def test_dictionary_from_pandas_specified_type():
     assert result.type.equals(typ)
     assert result.to_pylist() == ['a', 'b']
 
-    # mismatching values type -> raise error (for now a deprecation warning)
+    # mismatching values type -> raise error
     typ = pa.dictionary(index_type=pa.int8(), value_type=pa.int64())
-    with pytest.warns(FutureWarning):
+    with pytest.raises(pa.ArrowInvalid):
         result = pa.array(cat, type=typ)
-    assert result.to_pylist() == ['a', 'b']
 
     # mismatching order -> raise error (for now a deprecation warning)
     typ = pa.dictionary(

@@ -17,24 +17,26 @@
 
 //! Implementation of DataFrame API
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::arrow::record_batch::RecordBatch;
 use crate::dataframe::*;
 use crate::error::Result;
 use crate::execution::context::{ExecutionContext, ExecutionContextState};
-use crate::logicalplan::{col, Expr, LogicalPlan, LogicalPlanBuilder};
+use crate::logical_plan::{col, Expr, FunctionRegistry, LogicalPlan, LogicalPlanBuilder};
 use arrow::datatypes::Schema;
+
+use async_trait::async_trait;
 
 /// Implementation of DataFrame API
 pub struct DataFrameImpl {
-    ctx_state: Arc<Mutex<ExecutionContextState>>,
+    ctx_state: ExecutionContextState,
     plan: LogicalPlan,
 }
 
 impl DataFrameImpl {
     /// Create a new Table based on an existing logical plan
-    pub fn new(ctx_state: Arc<Mutex<ExecutionContextState>>, plan: &LogicalPlan) -> Self {
+    pub fn new(ctx_state: ExecutionContextState, plan: &LogicalPlan) -> Self {
         Self {
             ctx_state,
             plan: plan.clone(),
@@ -42,6 +44,7 @@ impl DataFrameImpl {
     }
 }
 
+#[async_trait]
 impl DataFrame for DataFrameImpl {
     /// Apply a projection based on a list of column names
     fn select_columns(&self, columns: Vec<&str>) -> Result<Arc<dyn DataFrame>> {
@@ -104,14 +107,29 @@ impl DataFrame for DataFrameImpl {
         self.plan.clone()
     }
 
-    fn collect(&self) -> Result<Vec<RecordBatch>> {
-        let mut ctx = ExecutionContext::from(self.ctx_state.clone());
-        ctx.collect_plan(&self.plan.clone())
+    // Convert the logical plan represented by this DataFrame into a physical plan and
+    // execute it
+    async fn collect(&self) -> Result<Vec<RecordBatch>> {
+        let ctx = ExecutionContext::from(self.ctx_state.clone());
+        let plan = ctx.optimize(&self.plan)?;
+        let plan = ctx.create_physical_plan(&plan)?;
+        Ok(ctx.collect(plan).await?)
     }
 
     /// Returns the schema from the logical plan
     fn schema(&self) -> &Schema {
-        self.plan.schema().as_ref()
+        self.plan.schema()
+    }
+
+    fn explain(&self, verbose: bool) -> Result<Arc<dyn DataFrame>> {
+        let plan = LogicalPlanBuilder::from(&self.plan)
+            .explain(verbose)?
+            .build()?;
+        Ok(Arc::new(DataFrameImpl::new(self.ctx_state.clone(), &plan)))
+    }
+
+    fn registry(&self) -> &dyn FunctionRegistry {
+        &self.ctx_state
     }
 }
 
@@ -120,8 +138,9 @@ mod tests {
     use super::*;
     use crate::datasource::csv::CsvReadOptions;
     use crate::execution::context::ExecutionContext;
-    use crate::logicalplan::*;
-    use crate::test;
+    use crate::logical_plan::*;
+    use crate::{physical_plan::functions::ScalarFunctionImplementation, test};
+    use arrow::{array::ArrayRef, datatypes::DataType};
 
     #[test]
     fn select_columns() -> Result<()> {
@@ -194,6 +213,61 @@ mod tests {
         // build query using SQL
         let sql_plan =
             create_plan("SELECT c1, c2, c11 FROM aggregate_test_100 LIMIT 10")?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[test]
+    fn explain() -> Result<()> {
+        // build query using Table API
+        let df = test_table()?;
+        let df = df
+            .select_columns(vec!["c1", "c2", "c11"])?
+            .limit(10)?
+            .explain(false)?;
+        let plan = df.to_logical_plan();
+
+        // build query using SQL
+        let sql_plan =
+            create_plan("EXPLAIN SELECT c1, c2, c11 FROM aggregate_test_100 LIMIT 10")?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry() -> Result<()> {
+        let mut ctx = ExecutionContext::new();
+        register_aggregate_csv(&mut ctx)?;
+
+        // declare the udf
+        let my_fn: ScalarFunctionImplementation =
+            Arc::new(|_: &[ArrayRef]| unimplemented!("my_fn is not implemented"));
+
+        // create and register the udf
+        ctx.register_udf(create_udf(
+            "my_fn",
+            vec![DataType::Float64],
+            Arc::new(DataType::Float64),
+            my_fn,
+        ));
+
+        // build query with a UDF using DataFrame API
+        let df = ctx.table("aggregate_test_100")?;
+
+        let f = df.registry();
+
+        let df = df.select(vec![f.udf("my_fn")?.call(vec![col("c12")])])?;
+        let plan = df.to_logical_plan();
+
+        // build query using SQL
+        let sql_plan =
+            ctx.create_logical_plan("SELECT my_fn(c12) FROM aggregate_test_100")?;
 
         // the two plans should be identical
         assert_same_plan(&plan, &sql_plan);

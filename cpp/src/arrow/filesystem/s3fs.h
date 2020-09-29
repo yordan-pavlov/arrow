@@ -40,12 +40,16 @@ class STSClient;
 namespace arrow {
 namespace fs {
 
-extern ARROW_EXPORT const char* kS3DefaultRegion;
-
 /// Options for the S3FileSystem implementation.
 struct ARROW_EXPORT S3Options {
-  /// AWS region to connect to (default "us-east-1")
-  std::string region = kS3DefaultRegion;
+  /// AWS region to connect to.
+  ///
+  /// If unset, the AWS SDK will choose a default value.  The exact algorithm
+  /// depends on the SDK version.  Before 1.8, the default is hardcoded
+  /// to "us-east-1".  Since 1.8, several heuristics are used to determine
+  /// the region (environment variables, configuration profile, EC2 metadata
+  /// server).
+  std::string region;
 
   /// If non-empty, override region with a connect string such as "localhost:9000"
   // XXX perhaps instead take a URL like "http://localhost:9000"?
@@ -95,10 +99,12 @@ struct ARROW_EXPORT S3Options {
   /// This is recommended if you use the standard AWS environment variables
   /// and/or configuration file.
   static S3Options Defaults();
+
   /// \brief Initialize with anonymous credentials.
   ///
   /// This will only let you access public buckets.
   static S3Options Anonymous();
+
   /// \brief Initialize with explicit access and secret key.
   ///
   /// Optionally, a session token may also be provided for temporary credentials
@@ -106,11 +112,13 @@ struct ARROW_EXPORT S3Options {
   static S3Options FromAccessKey(const std::string& access_key,
                                  const std::string& secret_key,
                                  const std::string& session_token = "");
+
   /// \brief Initialize from an assumed role.
   static S3Options FromAssumeRole(
       const std::string& role_arn, const std::string& session_name = "",
       const std::string& external_id = "", int load_frequency = 900,
       const std::shared_ptr<Aws::STS::STSClient>& stsClient = NULLPTR);
+
   static Result<S3Options> FromUri(const ::arrow::internal::Uri& uri,
                                    std::string* out_path = NULLPTR);
   static Result<S3Options> FromUri(const std::string& uri,
@@ -127,7 +135,11 @@ class ARROW_EXPORT S3FileSystem : public FileSystem {
   ~S3FileSystem() override;
 
   std::string type_name() const override { return "s3"; }
+
+  /// Return the original S3 options when constructing the filesystem
   S3Options options() const;
+  /// Return the actual region this filesystem connects to
+  std::string region() const;
 
   bool Equals(const FileSystem& other) const override;
 
@@ -215,6 +227,9 @@ Status EnsureS3Initialized();
 /// Shutdown the S3 APIs.
 ARROW_EXPORT
 Status FinalizeS3();
+
+ARROW_EXPORT
+Result<std::string> ResolveBucketRegion(const std::string& bucket);
 
 }  // namespace fs
 }  // namespace arrow

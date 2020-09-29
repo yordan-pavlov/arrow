@@ -65,10 +65,6 @@ Result<std::shared_ptr<FileFragment>> FileFormat::MakeFragment(
       new FileFragment(std::move(source), shared_from_this(),
                        std::move(partition_expression), std::move(physical_schema)));
 }
-Status FileFormat::WriteFragment(RecordBatchReader* batches,
-                                 io::OutputStream* destination) {
-  return Status::NotImplemented("writing fragment of format ", type_name());
-}
 
 Result<std::shared_ptr<Schema>> FileFragment::ReadPhysicalSchemaImpl() {
   return format_->Inspect(source_);
@@ -82,25 +78,27 @@ Result<ScanTaskIterator> FileFragment::Scan(std::shared_ptr<ScanOptions> options
 FileSystemDataset::FileSystemDataset(std::shared_ptr<Schema> schema,
                                      std::shared_ptr<Expression> root_partition,
                                      std::shared_ptr<FileFormat> format,
+                                     std::shared_ptr<fs::FileSystem> filesystem,
                                      std::vector<std::shared_ptr<FileFragment>> fragments)
     : Dataset(std::move(schema), std::move(root_partition)),
       format_(std::move(format)),
+      filesystem_(std::move(filesystem)),
       fragments_(std::move(fragments)) {}
 
 Result<std::shared_ptr<FileSystemDataset>> FileSystemDataset::Make(
     std::shared_ptr<Schema> schema, std::shared_ptr<Expression> root_partition,
-    std::shared_ptr<FileFormat> format,
+    std::shared_ptr<FileFormat> format, std::shared_ptr<fs::FileSystem> filesystem,
     std::vector<std::shared_ptr<FileFragment>> fragments) {
-  return std::shared_ptr<FileSystemDataset>(
-      new FileSystemDataset(std::move(schema), std::move(root_partition),
-                            std::move(format), std::move(fragments)));
+  return std::shared_ptr<FileSystemDataset>(new FileSystemDataset(
+      std::move(schema), std::move(root_partition), std::move(format),
+      std::move(filesystem), std::move(fragments)));
 }
 
 Result<std::shared_ptr<Dataset>> FileSystemDataset::ReplaceSchema(
     std::shared_ptr<Schema> schema) const {
   RETURN_NOT_OK(CheckProjectable(*schema_, *schema));
   return std::shared_ptr<Dataset>(new FileSystemDataset(
-      std::move(schema), partition_expression_, format_, fragments_));
+      std::move(schema), partition_expression_, format_, filesystem_, fragments_));
 }
 
 std::vector<std::string> FileSystemDataset::files() const {
@@ -174,7 +172,7 @@ Status WriteTask::Execute() {
 
   // TODO(bkietz) these calls to Partition() should be scattered across a TaskGroup
   for (auto maybe_batch : IteratorFromReader(batches)) {
-    ARROW_ASSIGN_OR_RAISE(auto batch, std::move(maybe_batch));
+    ARROW_ASSIGN_OR_RAISE(auto batch, maybe_batch);
     ARROW_ASSIGN_OR_RAISE(auto partitioned_batches, partitioning->Partition(batch));
     for (auto&& partitioned_batch : partitioned_batches) {
       AndExpression expr(std::move(partitioned_batch.partition_expression),
@@ -210,7 +208,7 @@ Status FileSystemDataset::Write(std::shared_ptr<Schema> schema,
                                 FragmentIterator fragment_it) {
   auto task_group = scan_context->TaskGroup();
 
-  base_dir = fs::internal::RemoveTrailingSlash(base_dir).to_string();
+  base_dir = std::string(fs::internal::RemoveTrailingSlash(base_dir));
 
   for (const auto& f : partitioning->schema()->fields()) {
     if (f->type()->id() == Type::DICTIONARY) {
@@ -220,7 +218,7 @@ Status FileSystemDataset::Write(std::shared_ptr<Schema> schema,
 
   int i = 0;
   for (auto maybe_fragment : fragment_it) {
-    ARROW_ASSIGN_OR_RAISE(auto fragment, std::move(maybe_fragment));
+    ARROW_ASSIGN_OR_RAISE(auto fragment, maybe_fragment);
     auto task = std::make_shared<WriteTask>();
 
     task->basename = "dat_" + std::to_string(i++) + "." + format->type_name();

@@ -105,12 +105,21 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
                 OFF)
 
   define_option_string(ARROW_SIMD_LEVEL
-                       "SIMD compiler optimization level"
+                       "Compile-time SIMD optimization level"
                        "SSE4_2" # default to SSE4.2
                        "NONE"
                        "SSE4_2"
                        "AVX2"
                        "AVX512")
+
+  define_option_string(ARROW_RUNTIME_SIMD_LEVEL
+                       "Max runtime SIMD optimization level"
+                       "MAX" # default to max supported by compiler
+                       "NONE"
+                       "SSE4_2"
+                       "AVX2"
+                       "AVX512"
+                       "MAX")
 
   # Arm64 architectures and extensions can lead to exploding combinations.
   # So set it directly through cmake command line.
@@ -351,7 +360,7 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
                 "Build with support for Unicode properties using the utf8proc library" ON)
 
   #----------------------------------------------------------------------
-  if(MSVC)
+  if(MSVC_TOOLCHAIN)
     set_option_category("MSVC")
 
     define_option(MSVC_LINK_VERBOSE

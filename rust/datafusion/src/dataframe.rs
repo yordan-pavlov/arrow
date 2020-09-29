@@ -19,9 +19,11 @@
 
 use crate::arrow::record_batch::RecordBatch;
 use crate::error::Result;
-use crate::logicalplan::{Expr, LogicalPlan};
+use crate::logical_plan::{Expr, FunctionRegistry, LogicalPlan};
 use arrow::datatypes::Schema;
 use std::sync::Arc;
+
+use async_trait::async_trait;
 
 /// DataFrame represents a logical set of rows with the same named columns.
 /// Similar to a [Pandas DataFrame](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html) or
@@ -47,6 +49,7 @@ use std::sync::Arc;
 /// # Ok(())
 /// # }
 /// ```
+#[async_trait]
 pub trait DataFrame {
     /// Filter the DataFrame by column. Returns a new DataFrame only containing the
     /// specified columns.
@@ -71,7 +74,7 @@ pub trait DataFrame {
     /// # fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let df = df.select(vec![col("a").multiply(col("b")), col("c")])?;
+    /// let df = df.select(vec![col("a") * col("b"), col("c")])?;
     /// # Ok(())
     /// # }
     /// ```
@@ -129,7 +132,7 @@ pub trait DataFrame {
     fn limit(&self, n: usize) -> Result<Arc<dyn DataFrame>>;
 
     /// Sort the DataFrame by the specified sorting expressions. Any expression can be turned into
-    /// a sort expression by calling its [sort](../logicalplan/enum.Expr.html#method.sort) method.
+    /// a sort expression by calling its [sort](../logical_plan/enum.Expr.html#method.sort) method.
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -148,14 +151,15 @@ pub trait DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
-    /// # fn main() -> Result<()> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
     /// let mut ctx = ExecutionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
-    /// let batches = df.collect()?;
+    /// let batches = df.collect().await?;
     /// # Ok(())
     /// # }
     /// ```
-    fn collect(&self) -> Result<Vec<RecordBatch>>;
+    async fn collect(&self) -> Result<Vec<RecordBatch>>;
 
     /// Returns the schema describing the output of this DataFrame in terms of columns returned,
     /// where each column has a name, data type, and nullability attribute.
@@ -174,4 +178,34 @@ pub trait DataFrame {
 
     /// Return the logical plan represented by this DataFrame.
     fn to_logical_plan(&self) -> LogicalPlan;
+
+    /// Return a DataFrame with the explanation of its plan so far.
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let batches = df.limit(100)?.explain(false)?.collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn explain(&self, verbose: bool) -> Result<Arc<dyn DataFrame>>;
+
+    /// Return a `FunctionRegistry` used to plan udf's calls
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # fn main() -> Result<()> {
+    /// let mut ctx = ExecutionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+    /// let f = df.registry();
+    /// // use f.udf("name", vec![...]) to use the udf
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn registry(&self) -> &dyn FunctionRegistry;
 }

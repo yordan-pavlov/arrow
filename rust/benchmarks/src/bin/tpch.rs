@@ -26,7 +26,7 @@ use arrow::util::pretty;
 use datafusion::error::Result;
 use datafusion::execution::context::{ExecutionConfig, ExecutionContext};
 
-use datafusion::execution::physical_plan::csv::CsvReadOptions;
+use datafusion::physical_plan::csv::CsvReadOptions;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -61,7 +61,8 @@ struct TpchOpt {
     file_format: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opt = TpchOpt::from_args();
     println!("Running benchmarks with the following options: {:?}", opt);
 
@@ -73,6 +74,16 @@ fn main() -> Result<()> {
     let path = opt.path.to_str().unwrap();
 
     match opt.file_format.as_str() {
+        // dbgen creates .tbl ('|' delimited) files
+        "tbl" => {
+            let path = format!("{}/lineitem.tbl", path);
+            let schema = lineitem_schema();
+            let options = CsvReadOptions::new()
+                .schema(&schema)
+                .delimiter(b'|')
+                .file_extension(".tbl");
+            ctx.register_csv("lineitem", &path, options)?
+        }
         "csv" => {
             let path = format!("{}/lineitem", path);
             let schema = lineitem_schema();
@@ -119,7 +130,7 @@ fn main() -> Result<()> {
 
     for i in 0..opt.iterations {
         let start = Instant::now();
-        execute_sql(&mut ctx, sql, opt.debug)?;
+        execute_sql(&mut ctx, sql, opt.debug).await?;
         println!(
             "Query {} iteration {} took {} ms",
             opt.query,
@@ -131,14 +142,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn execute_sql(ctx: &mut ExecutionContext, sql: &str, debug: bool) -> Result<()> {
+async fn execute_sql(ctx: &mut ExecutionContext, sql: &str, debug: bool) -> Result<()> {
     let plan = ctx.create_logical_plan(sql)?;
     let plan = ctx.optimize(&plan)?;
     if debug {
         println!("Optimized logical plan:\n{:?}", plan);
     }
     let physical_plan = ctx.create_physical_plan(&plan)?;
-    let result = ctx.collect(physical_plan.as_ref())?;
+    let result = ctx.collect(physical_plan).await?;
     if debug {
         pretty::print_batches(&result)?;
     }

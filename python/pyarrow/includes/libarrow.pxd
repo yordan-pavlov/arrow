@@ -969,12 +969,15 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         vector[shared_ptr[CScalar]] value
         CResult[shared_ptr[CScalar]] field(CFieldRef ref) const
 
-    cdef cppclass CDictionaryScalar" arrow::DictionaryScalar"(CScalar):
-        cppclass CDictionaryValue "arrow::DictionaryScalar::ValueType":
-            shared_ptr[CScalar] index
-            shared_ptr[CArray] dictionary
+    cdef cppclass CDictionaryScalarIndexAndDictionary \
+            "arrow::DictionaryScalar::ValueType":
+        shared_ptr[CScalar] index
+        shared_ptr[CArray] dictionary
 
-        CDictionaryValue value
+    cdef cppclass CDictionaryScalar" arrow::DictionaryScalar"(CScalar):
+        CDictionaryScalar(CDictionaryScalarIndexAndDictionary value,
+                          shared_ptr[CDataType], c_bool is_valid)
+        CDictionaryScalarIndexAndDictionary value
         CResult[shared_ptr[CScalar]] GetEncodedValue()
 
     cdef cppclass CUnionScalar" arrow::UnionScalar"(CScalar):
@@ -1397,12 +1400,12 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
             unique_ptr[CMessageReader] message_reader,
             const CIpcReadOptions& options)
 
-    CResult[shared_ptr[CRecordBatchWriter]] NewStreamWriter(
-        COutputStream* sink, const shared_ptr[CSchema]& schema,
+    CResult[shared_ptr[CRecordBatchWriter]] MakeStreamWriter(
+        shared_ptr[COutputStream] sink, const shared_ptr[CSchema]& schema,
         CIpcWriteOptions& options)
 
-    CResult[shared_ptr[CRecordBatchWriter]] NewFileWriter(
-        COutputStream* sink, const shared_ptr[CSchema]& schema,
+    CResult[shared_ptr[CRecordBatchWriter]] MakeFileWriter(
+        shared_ptr[COutputStream] sink, const shared_ptr[CSchema]& schema,
         CIpcWriteOptions& options)
 
     cdef cppclass CRecordBatchFileReader \
@@ -1441,8 +1444,7 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         const CIpcReadOptions& options)
 
     CResult[shared_ptr[CBuffer]] SerializeSchema(
-        const CSchema& schema, CDictionaryMemo* dictionary_memo,
-        CMemoryPool* pool)
+        const CSchema& schema, CMemoryPool* pool)
 
     CResult[shared_ptr[CBuffer]] SerializeRecordBatch(
         const CRecordBatch& schema, const CIpcWriteOptions& options)
@@ -1708,6 +1710,17 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
             " arrow::compute::TakeOptions"(CFunctionOptions):
         c_bool boundscheck
 
+    enum CMinMaxMode \
+            "arrow::compute::MinMaxOptions::Mode":
+        CMinMaxMode_SKIP \
+            "arrow::compute::MinMaxOptions::SKIP"
+        CMinMaxMode_EMIT_NULL \
+            "arrow::compute::MinMaxOptions::EMIT_NULL"
+
+    cdef cppclass CMinMaxOptions \
+            "arrow::compute::MinMaxOptions"(CFunctionOptions):
+        CMinMaxMode null_handling
+
     enum DatumType" arrow::Datum::type":
         DatumType_NONE" arrow::Datum::NONE"
         DatumType_SCALAR" arrow::Datum::SCALAR"
@@ -1736,9 +1749,8 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
 
 cdef extern from "arrow/python/api.h" namespace "arrow::py":
     # Requires GIL
-    CStatus InferArrowType(object obj, object mask,
-                           c_bool pandas_null_sentinels,
-                           shared_ptr[CDataType]* out_type)
+    CResult[shared_ptr[CDataType]] InferArrowType(
+        object obj, object mask, c_bool pandas_null_sentinels)
 
 
 cdef extern from "arrow/python/api.h" namespace "arrow::py" nogil:
@@ -1754,12 +1766,13 @@ cdef extern from "arrow/python/api.h" namespace "arrow::py" nogil:
         CMemoryPool* pool
         c_bool from_pandas
         c_bool ignore_timezone
+        c_bool strict
 
     # TODO Some functions below are not actually "nogil"
 
-    CStatus ConvertPySequence(object obj, object mask,
-                              const PyConversionOptions& options,
-                              shared_ptr[CChunkedArray]* out)
+    CResult[shared_ptr[CChunkedArray]] ConvertPySequence(
+        object obj, object mask, const PyConversionOptions& options,
+        CMemoryPool* pool)
 
     CStatus NumPyDtypeToArrow(object dtype, shared_ptr[CDataType]* type)
 
@@ -2033,6 +2046,7 @@ cdef extern from 'arrow/util/iterator.h' namespace 'arrow' nogil:
             bint operator!=(RangeIterator) const
         RangeIterator begin()
         RangeIterator end()
+    CIterator[T] MakeVectorIterator[T](vector[T] v)
 
 cdef extern from 'arrow/util/thread_pool.h' namespace 'arrow' nogil:
     int GetCpuThreadPoolCapacity()

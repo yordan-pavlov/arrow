@@ -15,11 +15,14 @@
 //! Filter Push Down optimizer rule ensures that filters are applied as early as possible in the plan
 
 use crate::error::Result;
-use crate::logicalplan::Expr;
-use crate::logicalplan::{and, LogicalPlan};
+use crate::logical_plan::Expr;
+use crate::logical_plan::{and, LogicalPlan};
 use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::utils;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Filter Push Down optimizer rule pushes filter clauses down the plan
 ///
@@ -268,7 +271,7 @@ fn optimize_plan(
     if let Some(expr) = new_filters.get(&depth) {
         return Ok(LogicalPlan::Filter {
             predicate: expr.clone(),
-            input: Box::new(new_plan),
+            input: Arc::new(new_plan),
         });
     } else {
         Ok(new_plan)
@@ -299,8 +302,8 @@ fn rewrite(expr: &Expr, projection: &HashMap<String, Expr>) -> Result<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logicalplan::col;
-    use crate::logicalplan::{aggregate_expr, lit, Expr, LogicalPlanBuilder, Operator};
+    use crate::logical_plan::col;
+    use crate::logical_plan::{lit, sum, Expr, LogicalPlanBuilder, Operator};
     use crate::test::*;
 
     fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
@@ -366,10 +369,7 @@ mod tests {
     fn filter_move_agg() -> Result<()> {
         let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(&table_scan)
-            .aggregate(
-                vec![col("a")],
-                vec![aggregate_expr("SUM", col("b")).alias("total_salary")],
-            )?
+            .aggregate(vec![col("a")], vec![sum(col("b")).alias("total_salary")])?
             .filter(col("a").gt(lit(10i64)))?
             .build()?;
         // filter of key aggregation is commutative
@@ -385,10 +385,7 @@ mod tests {
     fn filter_keep_agg() -> Result<()> {
         let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(&table_scan)
-            .aggregate(
-                vec![col("a")],
-                vec![aggregate_expr("SUM", col("b")).alias("b")],
-            )?
+            .aggregate(vec![col("a")], vec![sum(col("b")).alias("b")])?
             .filter(col("b").gt(lit(10i64)))?
             .build()?;
         // filter of aggregate is after aggregation since they are non-commutative
@@ -505,7 +502,7 @@ mod tests {
         let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(&table_scan)
             .project(vec![col("a").alias("b"), col("c")])?
-            .aggregate(vec![col("b")], vec![aggregate_expr("SUM", col("c"))])?
+            .aggregate(vec![col("b")], vec![sum(col("c"))])?
             .filter(col("b").gt(lit(10i64)))?
             .filter(col("SUM(c)").gt(lit(10i64)))?
             .build()?;

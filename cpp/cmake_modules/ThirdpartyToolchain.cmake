@@ -552,7 +552,7 @@ endif()
 set(EP_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}}")
 set(EP_C_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${UPPERCASE_BUILD_TYPE}}")
 
-if(NOT MSVC)
+if(NOT MSVC_TOOLCHAIN)
   # Set -fPIC on all external projects
   set(EP_CXX_FLAGS "${EP_CXX_FLAGS} -fPIC")
   set(EP_C_FLAGS "${EP_C_FLAGS} -fPIC")
@@ -1348,7 +1348,7 @@ if(ARROW_WITH_PROTOBUF)
   endif()
   resolve_dependency(Protobuf REQUIRED_VERSION ${ARROW_PROTOBUF_REQUIRED_VERSION})
 
-  if(ARROW_PROTOBUF_USE_SHARED AND MSVC)
+  if(ARROW_PROTOBUF_USE_SHARED AND MSVC_TOOLCHAIN)
     add_definitions(-DPROTOBUF_USE_DLLS)
   endif()
 
@@ -2675,6 +2675,17 @@ endmacro()
 if(ARROW_S3)
   # See https://aws.amazon.com/blogs/developer/developer-experience-of-the-aws-sdk-for-c-now-simplified-by-cmake/
 
+  # Workaround to force AWS cmake configuration to look for shared libraries
+  if(DEFINED ENV{CONDA_PREFIX})
+    if(DEFINED BUILD_SHARED_LIBS)
+      set(BUILD_SHARED_LIBS_WAS_SET TRUE)
+      set(BUILD_SHARED_LIBS_VALUE ${BUILD_SHARED_LIBS})
+    else()
+      set(BUILD_SHARED_LIBS_WAS_SET FALSE)
+    endif()
+    set(BUILD_SHARED_LIBS "ON")
+  endif()
+
   # Need to customize the find_package() call, so cannot call resolve_dependency()
   if(AWSSDK_SOURCE STREQUAL "AUTO")
     find_package(AWSSDK
@@ -2697,6 +2708,15 @@ if(ARROW_S3)
                             sts)
   endif()
 
+  # Restore previous value of BUILD_SHARED_LIBS
+  if(DEFINED ENV{CONDA_PREFIX})
+    if(BUILD_SHARED_LIBS_WAS_SET)
+      set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_VALUE})
+    else()
+      unset(BUILD_SHARED_LIBS)
+    endif()
+  endif()
+
   include_directories(SYSTEM ${AWSSDK_INCLUDE_DIR})
   message(STATUS "Found AWS SDK headers: ${AWSSDK_INCLUDE_DIR}")
   message(STATUS "Found AWS SDK libraries: ${AWSSDK_LINK_LIBRARIES}")
@@ -2716,6 +2736,6 @@ message(STATUS "All bundled static libraries: ${ARROW_BUNDLED_STATIC_LIBS}")
 
 # Write out the package configurations.
 
-configure_file("src/arrow/util/config.h.cmake" "src/arrow/util/config.h")
+configure_file("src/arrow/util/config.h.cmake" "src/arrow/util/config.h" ESCAPE_QUOTES)
 install(FILES "${ARROW_BINARY_DIR}/src/arrow/util/config.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/util")

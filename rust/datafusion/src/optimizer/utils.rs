@@ -17,13 +17,13 @@
 
 //! Collection of utility functions that are leveraged by the query optimizer rules
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{Schema, SchemaRef};
 
 use super::optimizer::OptimizerRule;
 use crate::error::{ExecutionError, Result};
-use crate::logicalplan::{Expr, LogicalPlan, PlanType, StringifiedPlan};
+use crate::logical_plan::{Expr, LogicalPlan, PlanType, StringifiedPlan};
 
 /// Recursively walk a list of expression trees, collecting the unique set of column
 /// names referenced in the expression
@@ -46,6 +46,10 @@ pub fn expr_to_column_names(expr: &Expr, accum: &mut HashSet<String>) -> Result<
             accum.insert(name.clone());
             Ok(())
         }
+        Expr::ScalarVariable(var_names) => {
+            accum.insert(var_names.join("."));
+            Ok(())
+        }
         Expr::Literal(_) => {
             // not needed
             Ok(())
@@ -61,126 +65,13 @@ pub fn expr_to_column_names(expr: &Expr, accum: &mut HashSet<String>) -> Result<
         Expr::Cast { expr, .. } => expr_to_column_names(expr, accum),
         Expr::Sort { expr, .. } => expr_to_column_names(expr, accum),
         Expr::AggregateFunction { args, .. } => exprlist_to_column_names(args, accum),
+        Expr::AggregateUDF { args, .. } => exprlist_to_column_names(args, accum),
         Expr::ScalarFunction { args, .. } => exprlist_to_column_names(args, accum),
+        Expr::ScalarUDF { args, .. } => exprlist_to_column_names(args, accum),
         Expr::Wildcard => Err(ExecutionError::General(
             "Wildcard expressions are not valid in a logical query plan".to_owned(),
         )),
         Expr::Nested(e) => expr_to_column_names(e, accum),
-    }
-}
-
-/// Given two datatypes, determine the supertype that both types can safely be cast to
-pub fn get_supertype(l: &DataType, r: &DataType) -> Result<DataType> {
-    match _get_supertype(l, r) {
-        Some(dt) => Ok(dt),
-        None => _get_supertype(r, l).ok_or_else(|| {
-            ExecutionError::InternalError(format!(
-                "Failed to determine supertype of {:?} and {:?}",
-                l, r
-            ))
-        }),
-    }
-}
-
-/// Given two datatypes, determine the supertype that both types can safely be cast to
-fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
-    use arrow::datatypes::DataType::*;
-    match (l, r) {
-        (UInt8, Int8) => Some(Int8),
-        (UInt8, Int16) => Some(Int16),
-        (UInt8, Int32) => Some(Int32),
-        (UInt8, Int64) => Some(Int64),
-
-        (UInt16, Int16) => Some(Int16),
-        (UInt16, Int32) => Some(Int32),
-        (UInt16, Int64) => Some(Int64),
-
-        (UInt32, Int32) => Some(Int32),
-        (UInt32, Int64) => Some(Int64),
-
-        (UInt64, Int64) => Some(Int64),
-
-        (Int8, UInt8) => Some(Int8),
-
-        (Int16, UInt8) => Some(Int16),
-        (Int16, UInt16) => Some(Int16),
-
-        (Int32, UInt8) => Some(Int32),
-        (Int32, UInt16) => Some(Int32),
-        (Int32, UInt32) => Some(Int32),
-
-        (Int64, UInt8) => Some(Int64),
-        (Int64, UInt16) => Some(Int64),
-        (Int64, UInt32) => Some(Int64),
-        (Int64, UInt64) => Some(Int64),
-
-        (UInt8, UInt8) => Some(UInt8),
-        (UInt8, UInt16) => Some(UInt16),
-        (UInt8, UInt32) => Some(UInt32),
-        (UInt8, UInt64) => Some(UInt64),
-        (UInt8, Float32) => Some(Float32),
-        (UInt8, Float64) => Some(Float64),
-
-        (UInt16, UInt8) => Some(UInt16),
-        (UInt16, UInt16) => Some(UInt16),
-        (UInt16, UInt32) => Some(UInt32),
-        (UInt16, UInt64) => Some(UInt64),
-        (UInt16, Float32) => Some(Float32),
-        (UInt16, Float64) => Some(Float64),
-
-        (UInt32, UInt8) => Some(UInt32),
-        (UInt32, UInt16) => Some(UInt32),
-        (UInt32, UInt32) => Some(UInt32),
-        (UInt32, UInt64) => Some(UInt64),
-        (UInt32, Float32) => Some(Float32),
-        (UInt32, Float64) => Some(Float64),
-
-        (UInt64, UInt8) => Some(UInt64),
-        (UInt64, UInt16) => Some(UInt64),
-        (UInt64, UInt32) => Some(UInt64),
-        (UInt64, UInt64) => Some(UInt64),
-        (UInt64, Float32) => Some(Float32),
-        (UInt64, Float64) => Some(Float64),
-
-        (Int8, Int8) => Some(Int8),
-        (Int8, Int16) => Some(Int16),
-        (Int8, Int32) => Some(Int32),
-        (Int8, Int64) => Some(Int64),
-        (Int8, Float32) => Some(Float32),
-        (Int8, Float64) => Some(Float64),
-
-        (Int16, Int8) => Some(Int16),
-        (Int16, Int16) => Some(Int16),
-        (Int16, Int32) => Some(Int32),
-        (Int16, Int64) => Some(Int64),
-        (Int16, Float32) => Some(Float32),
-        (Int16, Float64) => Some(Float64),
-
-        (Int32, Int8) => Some(Int32),
-        (Int32, Int16) => Some(Int32),
-        (Int32, Int32) => Some(Int32),
-        (Int32, Int64) => Some(Int64),
-        (Int32, Float32) => Some(Float32),
-        (Int32, Float64) => Some(Float64),
-
-        (Int64, Int8) => Some(Int64),
-        (Int64, Int16) => Some(Int64),
-        (Int64, Int32) => Some(Int64),
-        (Int64, Int64) => Some(Int64),
-        (Int64, Float32) => Some(Float32),
-        (Int64, Float64) => Some(Float64),
-
-        (Float32, Float32) => Some(Float32),
-        (Float32, Float64) => Some(Float64),
-        (Float64, Float32) => Some(Float64),
-        (Float64, Float64) => Some(Float64),
-
-        (Utf8, _) => Some(Utf8),
-        (_, Utf8) => Some(Utf8),
-
-        (Boolean, Boolean) => Some(Boolean),
-
-        _ => None,
     }
 }
 
@@ -196,14 +87,14 @@ pub fn optimize_explain(
     // These are the fields of LogicalPlan::Explain It might be nice
     // to transform that enum Variant into its own struct and avoid
     // passing the fields individually
-    let plan = Box::new(optimizer.optimize(plan)?);
+    let plan = Arc::new(optimizer.optimize(plan)?);
     let mut stringified_plans = stringified_plans.clone();
     let optimizer_name = optimizer.name().into();
     stringified_plans.push(StringifiedPlan::new(
         PlanType::OptimizedLogicalPlan { optimizer_name },
         format!("{:#?}", plan),
     ));
-    let schema = Box::new(schema.clone());
+    let schema = SchemaRef::new(schema.clone());
 
     Ok(LogicalPlan::Explain {
         verbose,
@@ -228,6 +119,7 @@ pub fn expressions(plan: &LogicalPlan) -> Vec<Expr> {
             result
         }
         LogicalPlan::Sort { expr, .. } => expr.clone(),
+        LogicalPlan::Extension { node } => node.expressions(),
         // plans without expressions
         LogicalPlan::TableScan { .. }
         | LogicalPlan::InMemoryScan { .. }
@@ -248,6 +140,7 @@ pub fn inputs(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         LogicalPlan::Aggregate { input, .. } => vec![input],
         LogicalPlan::Sort { input, .. } => vec![input],
         LogicalPlan::Limit { input, .. } => vec![input],
+        LogicalPlan::Extension { node } => node.inputs(),
         // plans without inputs
         LogicalPlan::TableScan { .. }
         | LogicalPlan::InMemoryScan { .. }
@@ -268,28 +161,31 @@ pub fn from_plan(
     match plan {
         LogicalPlan::Projection { schema, .. } => Ok(LogicalPlan::Projection {
             expr: expr.clone(),
-            input: Box::new(inputs[0].clone()),
+            input: Arc::new(inputs[0].clone()),
             schema: schema.clone(),
         }),
         LogicalPlan::Filter { .. } => Ok(LogicalPlan::Filter {
             predicate: expr[0].clone(),
-            input: Box::new(inputs[0].clone()),
+            input: Arc::new(inputs[0].clone()),
         }),
         LogicalPlan::Aggregate {
             group_expr, schema, ..
         } => Ok(LogicalPlan::Aggregate {
             group_expr: expr[0..group_expr.len()].to_vec(),
             aggr_expr: expr[group_expr.len()..].to_vec(),
-            input: Box::new(inputs[0].clone()),
+            input: Arc::new(inputs[0].clone()),
             schema: schema.clone(),
         }),
         LogicalPlan::Sort { .. } => Ok(LogicalPlan::Sort {
             expr: expr.clone(),
-            input: Box::new(inputs[0].clone()),
+            input: Arc::new(inputs[0].clone()),
         }),
         LogicalPlan::Limit { n, .. } => Ok(LogicalPlan::Limit {
             n: *n,
-            input: Box::new(inputs[0].clone()),
+            input: Arc::new(inputs[0].clone()),
+        }),
+        LogicalPlan::Extension { node } => Ok(LogicalPlan::Extension {
+            node: node.from_template(expr, inputs),
         }),
         LogicalPlan::EmptyRelation { .. }
         | LogicalPlan::TableScan { .. }
@@ -309,11 +205,14 @@ pub fn expr_sub_expressions(expr: &Expr) -> Result<Vec<&Expr>> {
         Expr::IsNull(e) => Ok(vec![e]),
         Expr::IsNotNull(e) => Ok(vec![e]),
         Expr::ScalarFunction { args, .. } => Ok(args.iter().collect()),
+        Expr::ScalarUDF { args, .. } => Ok(args.iter().collect()),
         Expr::AggregateFunction { args, .. } => Ok(args.iter().collect()),
+        Expr::AggregateUDF { args, .. } => Ok(args.iter().collect()),
         Expr::Cast { expr, .. } => Ok(vec![expr]),
         Expr::Column(_) => Ok(vec![]),
         Expr::Alias(expr, ..) => Ok(vec![expr]),
         Expr::Literal(_) => Ok(vec![]),
+        Expr::ScalarVariable(_) => Ok(vec![]),
         Expr::Not(expr) => Ok(vec![expr]),
         Expr::Sort { expr, .. } => Ok(vec![expr]),
         Expr::Wildcard { .. } => Err(ExecutionError::General(
@@ -334,15 +233,20 @@ pub fn rewrite_expression(expr: &Expr, expressions: &Vec<Expr>) -> Result<Expr> 
         }),
         Expr::IsNull(_) => Ok(Expr::IsNull(Box::new(expressions[0].clone()))),
         Expr::IsNotNull(_) => Ok(Expr::IsNotNull(Box::new(expressions[0].clone()))),
-        Expr::ScalarFunction {
-            name, return_type, ..
-        } => Ok(Expr::ScalarFunction {
-            name: name.clone(),
-            return_type: return_type.clone(),
+        Expr::ScalarFunction { fun, .. } => Ok(Expr::ScalarFunction {
+            fun: fun.clone(),
             args: expressions.clone(),
         }),
-        Expr::AggregateFunction { name, .. } => Ok(Expr::AggregateFunction {
-            name: name.clone(),
+        Expr::ScalarUDF { fun, .. } => Ok(Expr::ScalarUDF {
+            fun: fun.clone(),
+            args: expressions.clone(),
+        }),
+        Expr::AggregateFunction { fun, .. } => Ok(Expr::AggregateFunction {
+            fun: fun.clone(),
+            args: expressions.clone(),
+        }),
+        Expr::AggregateUDF { fun, .. } => Ok(Expr::AggregateUDF {
+            fun: fun.clone(),
             args: expressions.clone(),
         }),
         Expr::Cast { data_type, .. } => Ok(Expr::Cast {
@@ -355,6 +259,7 @@ pub fn rewrite_expression(expr: &Expr, expressions: &Vec<Expr>) -> Result<Expr> 
         Expr::Not(_) => Ok(Expr::Not(Box::new(expressions[0].clone()))),
         Expr::Column(_) => Ok(expr.clone()),
         Expr::Literal(_) => Ok(expr.clone()),
+        Expr::ScalarVariable(_) => Ok(expr.clone()),
         Expr::Sort {
             asc, nulls_first, ..
         } => Ok(Expr::Sort {
@@ -372,7 +277,7 @@ pub fn rewrite_expression(expr: &Expr, expressions: &Vec<Expr>) -> Result<Expr> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logicalplan::{col, LogicalPlanBuilder};
+    use crate::logical_plan::{col, LogicalPlanBuilder};
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 

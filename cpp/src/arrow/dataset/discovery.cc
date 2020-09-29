@@ -180,20 +180,25 @@ Result<std::shared_ptr<DatasetFactory>> FileSystemDatasetFactory::Make(
   ARROW_ASSIGN_OR_RAISE(auto files, filesystem->GetFileInfo(selector));
 
   // Filter out anything that's not a file or that's explicitly ignored
+  Status st;
   auto files_end =
       std::remove_if(files.begin(), files.end(), [&](const fs::FileInfo& info) {
         if (!info.IsFile()) return true;
 
         auto relative = fs::internal::RemoveAncestor(selector.base_dir, info.path());
-        DCHECK(relative.has_value())
-            << "GetFileInfo() yielded path outside selector.base_dir";
+        if (!relative.has_value()) {
+          st = Status::Invalid("GetFileInfo() yielded path '", info.path(),
+                               "', which is outside base dir '", selector.base_dir, "'");
+          return false;
+        }
 
-        if (StartsWithAnyOf(relative->to_string(), options.selector_ignore_prefixes)) {
+        if (StartsWithAnyOf(std::string(*relative), options.selector_ignore_prefixes)) {
           return true;
         }
 
         return false;
       });
+  RETURN_NOT_OK(st);
   files.erase(files_end, files.end());
 
   // Sorting by path guarantees a stability sometimes needed by unit tests.
@@ -253,7 +258,7 @@ Result<std::shared_ptr<Dataset>> FileSystemDatasetFactory::Finish(FinishOptions 
     fragments.push_back(fragment);
   }
 
-  return FileSystemDataset::Make(schema, root_partition_, format_, fragments);
+  return FileSystemDataset::Make(schema, root_partition_, format_, fs_, fragments);
 }
 
 }  // namespace dataset

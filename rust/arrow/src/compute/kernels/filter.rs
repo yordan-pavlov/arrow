@@ -241,11 +241,21 @@ impl FilterContext {
         let filter_mask: Vec<u64> = (0..64).map(|x| 1u64 << x).collect();
         let filter_bytes = filter_array.data_ref().buffers()[0].data();
         let filtered_count = bit_util::count_set_bits(filter_bytes);
+
         // transmute filter_bytes to &[u64]
         let mut u64_buffer = MutableBuffer::new(filter_bytes.len());
-        u64_buffer
-            .write_bytes(filter_bytes, u64_buffer.capacity() - filter_bytes.len())?;
-        let filter_u64 = u64_buffer.typed_data_mut::<u64>().to_owned();
+        // add to the resulting len so is is a multiple of the size of u64
+        let pad_addional_len = (8 - filter_bytes.len() % 8) % 8;
+        u64_buffer.write_bytes(filter_bytes, pad_addional_len)?;
+        let mut filter_u64 = u64_buffer.typed_data_mut::<u64>().to_owned();
+
+        // mask of any bits outside of the given len
+        if filter_array.len() % 64 != 0 {
+            let last_idx = filter_u64.len() - 1;
+            let mask = u64::MAX >> (64 - filter_array.len() % 64);
+            filter_u64[last_idx] &= mask;
+        }
+
         Ok(FilterContext {
             filter_u64,
             filter_len: filter_array.len(),
@@ -597,9 +607,8 @@ mod tests {
     #[test]
     fn test_filter_array_low_density() {
         // this test exercises the all 0's branch of the filter algorithm
-        let mut data_values = (1..=65).into_iter().collect::<Vec<i32>>();
+        let mut data_values = (1..=65).collect::<Vec<i32>>();
         let mut filter_values = (1..=65)
-            .into_iter()
             .map(|i| match i % 65 {
                 0 => true,
                 _ => false,
@@ -620,9 +629,8 @@ mod tests {
     #[test]
     fn test_filter_array_high_density() {
         // this test exercises the all 1's branch of the filter algorithm
-        let mut data_values = (1..=65).into_iter().map(|x| Some(x)).collect::<Vec<_>>();
+        let mut data_values = (1..=65).map(Some).collect::<Vec<_>>();
         let mut filter_values = (1..=65)
-            .into_iter()
             .map(|i| match i % 65 {
                 0 => false,
                 _ => true,
@@ -687,7 +695,7 @@ mod tests {
     #[test]
     fn test_filter_dictionary_array() {
         let values = vec![Some("hello"), None, Some("world"), Some("!")];
-        let a: Int8DictionaryArray = values.iter().map(|&x| x).collect();
+        let a: Int8DictionaryArray = values.iter().copied().collect();
         let b = BooleanArray::from(vec![false, true, true, false]);
         let c = filter(&a, &b).unwrap();
         let d = c
@@ -706,5 +714,23 @@ mod tests {
             "world",
             values.value(d.keys().nth(1).unwrap().unwrap() as usize)
         );
+    }
+
+    #[test]
+    fn test_filter_string_array_with_negated_boolean_array() {
+        let a = StringArray::from(vec!["hello", " ", "world", "!"]);
+        let mut bb = BooleanBuilder::new(2);
+        bb.append_value(false).unwrap();
+        bb.append_value(true).unwrap();
+        bb.append_value(false).unwrap();
+        bb.append_value(true).unwrap();
+        let b = bb.finish();
+        let b = crate::compute::not(&b).unwrap();
+
+        let c = filter(&a, &b).unwrap();
+        let d = c.as_ref().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(2, d.len());
+        assert_eq!("hello", d.value(0));
+        assert_eq!("world", d.value(1));
     }
 }

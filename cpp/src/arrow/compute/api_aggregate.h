@@ -66,7 +66,7 @@ struct ARROW_EXPORT MinMaxOptions : public FunctionOptions {
     /// Skip null values
     SKIP = 0,
     /// Any nulls will result in null output
-    OUTPUT_NULL
+    EMIT_NULL
   };
 
   explicit MinMaxOptions(enum Mode null_handling = SKIP) : null_handling(null_handling) {}
@@ -130,30 +130,13 @@ Result<Datum> MinMax(const Datum& value,
                      const MinMaxOptions& options = MinMaxOptions::Defaults(),
                      ExecContext* ctx = NULLPTR);
 
-/// \brief Calculate the min / max of a numeric array.
-///
-/// This function returns both the min and max as a collection. The resulting
-/// datum thus consists of two scalar datums: {Datum(min), Datum(max)}
-///
-/// \param[in] array input array
-/// \param[in] options see MinMaxOptions for more information
-/// \param[in] ctx the function execution context, optional
-/// \return resulting datum containing a {min, max} collection
-///
-/// \since 1.0.0
-/// \note API not yet finalized
-ARROW_EXPORT
-Result<Datum> MinMax(const Array& array,
-                     const MinMaxOptions& options = MinMaxOptions::Defaults(),
-                     ExecContext* ctx = NULLPTR);
-
 /// \brief Calculate the modal (most common) value of a numeric array
 ///
 /// This function returns both mode and count as a struct scalar, with type
 /// struct<mode: T, count: int64>, where T is the input type.
 /// If there is more than one such value, the smallest one is returned.
 ///
-/// \param[in] value input datum, expecting Array
+/// \param[in] value input datum, expecting Array or ChunkedArray
 /// \param[in] ctx the function execution context, optional
 /// \return resulting datum as a struct<mode: T, count: int64> scalar
 ///
