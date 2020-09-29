@@ -17,6 +17,7 @@
 
 //! Defines miscellaneous array kernels.
 
+use crate::array::PrimitiveArrayOps;
 use crate::array::*;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
@@ -625,6 +626,8 @@ pub fn filter_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
+    use crate::datatypes::ToByteSlice;
 
     macro_rules! def_temporal_test {
         ($test:ident, $array_type: ident, $data: expr) => {
