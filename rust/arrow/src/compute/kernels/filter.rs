@@ -256,7 +256,47 @@ macro_rules! filter_primitive_item_list_array {
                             .downcast_ref::<PrimitiveArray<$item_type>>()
                             .unwrap();
                         for k in 0..inner_list.len() {
-                            if inner_list.is_null(j) {
+                            if inner_list.is_null(k) {
+                                builder.values().append_null()?;
+                            } else {
+                                builder.values().append_value(inner_list.value(k))?;
+                            }
+                        }
+                        builder.append(true)?;
+                    }
+                }
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }};
+}
+
+macro_rules! filter_non_primitive_item_list_array {
+    ($context:expr, $array:expr, $item_array_type:ident, $item_builder:ident) => {{
+        let input_array = $array.as_any().downcast_ref::<ListArray>().unwrap();
+        let values_builder = $item_builder::new($context.filtered_count);
+        let mut builder = ListBuilder::new(values_builder);
+        for i in 0..$context.filter_u64.len() {
+            // foreach u64 batch
+            let filter_batch = $context.filter_u64[i];
+            if filter_batch == 0 {
+                // if batch == 0: skip
+                continue;
+            }
+            for j in 0..64 {
+                // foreach bit in batch:
+                if (filter_batch & $context.filter_mask[j]) != 0 {
+                    let data_index = (i * 64) + j;
+                    if input_array.is_null(data_index) {
+                        builder.append(false)?;
+                    } else {
+                        let this_inner_list = input_array.value(data_index);
+                        let inner_list = this_inner_list
+                            .as_any()
+                            .downcast_ref::<$item_array_type>()
+                            .unwrap();
+                        for k in 0..inner_list.len() {
+                            if inner_list.is_null(k) {
                                 builder.values().append_null()?;
                             } else {
                                 builder.values().append_value(inner_list.value(k))?;
@@ -514,19 +554,18 @@ impl FilterContext {
                 DataType::Timestamp(TimeUnit::Nanosecond, _) => {
                     filter_primitive_item_list_array!(self, array, TimestampNanosecondType)
                 }
-                // TODO: finish support for non-primitive lists
-                // DataType::Binary => filter_non_primitive_item_list_array!(
-                //     array,
-                //     filter,
-                //     BinaryArray,
-                //     BinaryBuilder
-                // ),
-                // DataType::Utf8 => filter_non_primitive_item_list_array!(
-                //     array,
-                //     filter,
-                //     StringArray,
-                //     StringBuilder
-                // ),
+                DataType::Binary => filter_non_primitive_item_list_array!(
+                    self,
+                    array,
+                    BinaryArray,
+                    BinaryBuilder
+                ),
+                DataType::Utf8 => filter_non_primitive_item_list_array!(
+                    self,
+                    array,
+                    StringArray,
+                    StringBuilder
+                ),
                 other => {
                     Err(ArrowError::ComputeError(format!(
                         "filter not supported for List({:?})",
