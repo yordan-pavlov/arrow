@@ -365,6 +365,20 @@ impl<T> BufferPtr<T> {
             mem_tracker: self.mem_tracker.as_ref().cloned(),
         }
     }
+
+    /// Splits a new BufferPtr containing [start..len) and modifies this BufferPtr to [len..]
+    pub fn split_to(&mut self, len: usize) -> Self {
+        let start = self.start;
+        assert!(start + len <= self.len);
+        self.start += len;
+        self.len -= len;
+        Self {
+            data: self.data.clone(),
+            start: start,
+            len,
+            mem_tracker: self.mem_tracker.as_ref().cloned(),
+        }
+    }
 }
 
 impl<T: Sized> Index<usize> for BufferPtr<T> {

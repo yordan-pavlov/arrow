@@ -188,7 +188,7 @@ impl PageWriteSpec {
 
 /// API for reading pages from a column chunk.
 /// This offers a iterator like API to get the next page.
-pub trait PageReader {
+pub trait PageReader: Iterator<Item = Result<Page>> {
     /// Gets the next page in the column chunk associated with this reader.
     /// Returns `None` if there are no pages left.
     fn get_next_page(&mut self) -> Result<Option<Page>>;

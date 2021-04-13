@@ -50,6 +50,7 @@
 //! ```
 
 pub(in crate::arrow) mod array_reader;
+pub(in crate::arrow) mod arrow_array_reader;
 pub mod arrow_reader;
 pub mod arrow_writer;
 pub(in crate::arrow) mod converter;

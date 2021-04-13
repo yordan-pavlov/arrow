@@ -463,6 +463,14 @@ mod tests {
             Ok(self.pages.next())
         }
     }
+    
+    impl Iterator for TestPageReader {
+        type Item = Result<Page>;
+    
+        fn next(&mut self) -> Option<Self::Item> {
+            self.get_next_page().transpose()
+        }
+    }
 
     #[test]
     fn test_read_required_records() {

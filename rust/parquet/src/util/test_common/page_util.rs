@@ -181,6 +181,14 @@ impl PageReader for InMemoryPageReader {
     }
 }
 
+impl Iterator for InMemoryPageReader {
+    type Item = Result<Page>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.get_next_page().transpose()
+    }
+}
+
 /// A utility page iterator which stores page readers in memory, used for tests.
 pub struct InMemoryPageIterator {
     schema: SchemaDescPtr,
