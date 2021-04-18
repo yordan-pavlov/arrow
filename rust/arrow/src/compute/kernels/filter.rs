@@ -42,10 +42,10 @@ enum State {
 /// slots of a [BooleanArray] are true. Each interval corresponds to a contiguous region of memory to be
 /// "taken" from an array to be filtered.
 #[derive(Debug)]
-pub(crate) struct SlicesIterator<'a> {
+pub struct SlicesIterator<'a> {
     iter: Enumerate<BitChunkIterator<'a>>,
     state: State,
-    filter_count: usize,
+    filter: &'a BooleanArray,
     remainder_mask: u64,
     remainder_len: usize,
     chunk_len: usize,
@@ -57,19 +57,14 @@ pub(crate) struct SlicesIterator<'a> {
 }
 
 impl<'a> SlicesIterator<'a> {
-    pub(crate) fn new(filter: &'a BooleanArray) -> Self {
+    pub fn new(filter: &'a BooleanArray) -> Self {
         let values = &filter.data_ref().buffers()[0];
-
-        // this operation is performed before iteration
-        // because it is fast and allows reserving all the needed memory
-        let filter_count = values.count_set_bits_offset(filter.offset(), filter.len());
-
         let chunks = values.bit_chunks(filter.offset(), filter.len());
 
         Self {
             iter: chunks.iter().enumerate(),
             state: State::Chunks,
-            filter_count,
+            filter,
             remainder_len: chunks.remainder_len(),
             chunk_len: chunks.chunk_len(),
             remainder_mask: chunks.remainder_bits(),
@@ -79,6 +74,13 @@ impl<'a> SlicesIterator<'a> {
             current_chunk: 0,
             current_bit: 0,
         }
+    }
+
+    fn filtered_count(&self) -> usize {
+        let values = self.filter.values();
+        // this operation is performed before iteration
+        // because it is fast and allows reserving all the needed memory
+        values.count_set_bits_offset(self.filter.offset(), self.filter.len())
     }
 
     #[inline]
@@ -191,7 +193,7 @@ impl<'a> Iterator for SlicesIterator<'a> {
 /// Therefore, it is considered undefined behavior to pass `filter` with null values.
 pub fn build_filter(filter: &BooleanArray) -> Result<Filter> {
     let iter = SlicesIterator::new(filter);
-    let filter_count = iter.filter_count;
+    let filter_count = iter.filtered_count();
     let chunks = iter.collect::<Vec<_>>();
 
     Ok(Box::new(move |array: &ArrayData| {
@@ -224,7 +226,7 @@ pub fn filter(array: &Array, filter: &BooleanArray) -> Result<ArrayRef> {
     let iter = SlicesIterator::new(filter);
 
     let mut mutable =
-        MutableArrayData::new(vec![array.data_ref()], false, iter.filter_count);
+        MutableArrayData::new(vec![array.data_ref()], false, iter.filtered_count());
     iter.for_each(|(start, end)| mutable.extend(0, start, end));
     let data = mutable.freeze();
     Ok(make_array(data))
@@ -549,7 +551,7 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filtered_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(1, 2)]);
@@ -562,7 +564,7 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filtered_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(0, 1), (2, 64)]);
@@ -575,7 +577,7 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filtered_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(1, 62), (63, 124), (125, 130)]);

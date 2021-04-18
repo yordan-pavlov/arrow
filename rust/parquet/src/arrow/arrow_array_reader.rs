@@ -1,6 +1,6 @@
 use std::{any::Any, collections::VecDeque};
 use std::{rc::Rc, cell::RefCell};
-use arrow::{array::ArrayRef, datatypes::{DataType as ArrowType}};
+use arrow::{array::ArrayRef, datatypes::{DataType as ArrowType}, buffer::{MutableBuffer, Buffer}};
 use crate::{column::page::{Page, PageIterator}, memory::ByteBufferPtr, schema::types::{ColumnDescPtr, ColumnDescriptor}};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::errors::{ParquetError, Result};
@@ -251,7 +251,8 @@ struct ArrowArrayReader<'a> {
     data_type: ArrowType,
     def_level_iter: Box<dyn Iterator<Item = i16> + 'a>,
     rep_level_iter: Box<dyn Iterator<Item = i16> + 'a>,
-    value_iter_factory: SplittableBatchingIteratorFactory<'a, Result<(usize, ByteBufferPtr)>>
+    value_iter_factory: SplittableBatchingIteratorFactory<'a, Result<(usize, ByteBufferPtr)>>,
+    last_def_levels: Option<Vec<i16>>,
 }
 
 impl<'a> ArrowArrayReader<'a> {
@@ -302,6 +303,7 @@ impl<'a> ArrowArrayReader<'a> {
             def_level_iter: Box::new(def_level_iter),
             rep_level_iter: Box::new(rep_level_iter),
             value_iter_factory: SplittableBatchingIteratorFactory::new(value_iter),
+            last_def_levels: None,
         })
     }
 
@@ -372,6 +374,34 @@ impl<'a> ArrowArrayReader<'a> {
             )
         }
     }
+
+    fn convert_value_buffers(value_buffers: Vec<(usize, ByteBufferPtr)>) -> Result<arrow::array::ArrayData> {
+        use arrow::datatypes::ArrowNativeType;
+        let data_len = value_buffers.len();
+        let offset_size = std::mem::size_of::<i32>();
+        let mut offsets = MutableBuffer::new((data_len + 1) * offset_size);
+        let values_byte_len = value_buffers.iter().map(|(_len, bytes)| bytes.len()).sum();
+        let mut values = MutableBuffer::new(values_byte_len);
+
+        let mut length_so_far = i32::default();
+        offsets.push(length_so_far);
+
+        for (value_len, value_bytes) in value_buffers {
+            debug_assert_eq!(
+                value_len, 1,
+                "offset length value buffers can only contain bytes for a single value"
+            );
+            length_so_far += <i32 as ArrowNativeType>::from_usize(value_bytes.len()).unwrap();
+            offsets.push(length_so_far);
+            values.extend_from_slice(value_bytes.data());
+        }
+        let array_data = arrow::array::ArrayData::builder(ArrowType::Utf8)
+            .len(data_len)
+            .add_buffer(offsets.into())
+            .add_buffer(values.into())
+            .build();
+        Ok(array_data)
+    }
 }
 
 impl ArrayReader for ArrowArrayReader<'static> {
@@ -384,52 +414,80 @@ impl ArrayReader for ArrowArrayReader<'static> {
     }
 
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
-        // TODO: test conditional reading of def levels and creation of null bitmap
-        // if def levels are available - they determine how many values will be read
-        // read def level batch and produce:
-        // * null bitmap
-        // * number of (non-null) values to read
-        // should the value bitmap be Vec<bool> and then each converter would convert to arrow bitmap
-        // or should the arrow bitmap be produced here?
-        let mut null_bitmap = Vec::<bool>::with_capacity(batch_size);
-        let mut values_to_read: usize = 0;
-        let max_def_level = self.column_desc.max_def_level();
-        for (i, d) in self.def_level_iter.by_ref().take(batch_size).enumerate() {
-            null_bitmap[i] = if d == max_def_level {
-                values_to_read += 1;
-                true
-            }
-            else {
-                false
-            };
+        // check if def levels are available
+        let (values_to_read, null_bitmap_array) = if !Self::def_levels_available(&self.column_desc) {
+            // if no def levels - just read (up to) batch_size values
+            (batch_size, None)
         }
-        // read values
-        // should any errors from lower levels be consumed here
-        // or should errors be propagated to converters?
+        else {
+            // if def levels are available - they determine how many values will be read
+            let def_levels = self.def_level_iter
+                .by_ref()
+                .take(batch_size)
+                .collect::<Vec<_>>();
+            let def_level_count = def_levels.len();
+            let max_def_level = self.column_desc.max_def_level();
+            let null_bitmap_iter = def_levels.iter().map(|d| d == &max_def_level);
+            // use of from_trusted_len_iter_bool is safe because take() sets upper size hint
+            let null_bit_buffer: Buffer = unsafe { MutableBuffer::from_trusted_len_iter_bool(null_bitmap_iter).into() };
+            self.last_def_levels = Some(def_levels);
+            // it should be faster to use count_set_bits instead of incrementing during iteration
+            let values_to_read = null_bit_buffer.count_set_bits_offset(0, def_level_count);
+            let null_bitmap_array = {
+                let builder = arrow::array::ArrayData::builder(ArrowType::Boolean)
+                    .len(def_level_count)
+                    .add_buffer(null_bit_buffer);
+                let data = builder.build();
+                arrow::array::BooleanArray::from(data)
+            };
+            (values_to_read, Some(null_bitmap_array))
+        };
+
+        // read a batch of values
         let value_iter = self.value_iter_factory.get_batch_iter(values_to_read);
-        // TODO:
-        // * consume value iterator and collect into Vec
-        //   - this will separate reading and decoding values
-        //   - from creating an arrow array
-        // * stop at first error
-        // * call converter with collected values and null bitmap
-        // * return arrow array created by converter
+        // collect and unwrap values into Vec, return first error if any
+        // this will separate reading and decoding values from creating an arrow array
+        // extra memory is allocated for the Vec, but the values still point to the page buffer
+        let values: Vec<(usize, ByteBufferPtr)> = value_iter.collect::<Result<_>>()?;
+        // converter only creates a no-null / all value array data
+        let mut value_array_data = Self::convert_value_buffers(values)?;
 
-        // what is a better interface / abstraction for array converters?
-        // (Iterator<ByteBufferPtr>, Vec<bool>)
-        // (Iterator<ByteBufferPtr>, NullBitmap)
-        //  sequence of `ValueSequence(count, AsRef<[u8]>)` and `NullSequence(count)`
+        if let Some(null_bitmap_array) = null_bitmap_array {
+            // Only if def levels are available - insert null values efficiently using MutableArrayData.
+            // This will require value bytes to be copied again, but converter requirements are reduced.
+            // With a small number of NULLs, this will only be a few copies of large byte sequences.
+            let actual_batch_size = null_bitmap_array.len();
+            // TODO: optimize MutableArrayData::extend_offsets for sequential slices
+            // use_nulls is false, because null_bitmap_array is already calculated and re-used
+            let mut mutable = arrow::array::MutableArrayData::new(vec![&value_array_data], false, actual_batch_size);
+            // SlicesIterator slices only the true values, NULLs are inserted to fill any gaps
+            arrow::compute::SlicesIterator::new(&null_bitmap_array).for_each(|(start, end)| {
+                // the gap needs to be filled with NULLs
+                if start > mutable.len() {
+                    let nulls_to_add = start - mutable.len();
+                    mutable.extend_nulls(nulls_to_add);
+                }
+                // fill values, adjust start and end with NULL count so far
+                let nulls_added = mutable.null_count();
+                mutable.extend(0, start - nulls_added, end - nulls_added);
+            });
+            // any remaining part is NULLs
+            if mutable.len() < actual_batch_size {
+                let nulls_to_add = actual_batch_size - mutable.len();
+                mutable.extend_nulls(nulls_to_add);
+            }
+            
+            value_array_data = mutable
+                .into_builder()
+                .null_bit_buffer(null_bitmap_array.values().clone())
+                .build();
+        }
 
-        value_iter.for_each(|x| println!("{:?}", x.is_ok()));
-
-        Err(ParquetError::General("todo".into()))
+        Ok(arrow::array::make_array(value_array_data))
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        if Self::def_levels_available(&self.column_desc) {
-            // TODO: return actual def levels
-        }
-        None
+        self.last_def_levels.as_deref()
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
