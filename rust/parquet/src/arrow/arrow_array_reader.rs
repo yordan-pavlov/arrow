@@ -1,7 +1,7 @@
 use std::{any::Any, collections::VecDeque};
 use std::{rc::Rc, cell::RefCell};
-use arrow::{array::ArrayRef, datatypes::{DataType as ArrowType}, buffer::{MutableBuffer, Buffer}};
-use crate::{column::page::{Page, PageIterator}, memory::ByteBufferPtr, schema::types::{ColumnDescPtr, ColumnDescriptor}};
+use arrow::{array::{ArrayRef, Int16Array}, buffer::{MutableBuffer, Buffer}, datatypes::{DataType as ArrowType}};
+use crate::{column::page::{Page, PageIterator}, memory::{ByteBufferPtr, BufferPtr}, schema::types::{ColumnDescPtr, ColumnDescriptor}};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::errors::{ParquetError, Result};
 use super::array_reader::ArrayReader;
@@ -219,6 +219,32 @@ where
     }
 }
 
+impl<T: Clone> Splittable for Result<BufferPtr<T>> {
+    type BufferType = Result<BufferPtr<T>>;
+    type OutputType = Result<BufferPtr<T>>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Ok(x) => x.len(),
+            _ => 0
+        }
+    }
+
+    #[inline]
+    fn split(self, len: usize) -> (Self::BufferType, Self::BufferType) {
+        let mut buffer = if let Ok(item) = self {
+            item
+        }
+        else {
+            // this shouldn't happen as len() returns 0 for error
+            // so it should always be fully consumed and never split
+            return (self.clone(), self);
+        };
+        (Ok(buffer.split_to( len)), Ok(buffer))
+    }
+}
+
 impl Splittable for Result<(usize, ByteBufferPtr)> {
     type BufferType = Result<(usize, ByteBufferPtr)>;
     type OutputType = Result<(usize, ByteBufferPtr)>;
@@ -249,10 +275,11 @@ impl Splittable for Result<(usize, ByteBufferPtr)> {
 struct ArrowArrayReader<'a> {
     column_desc: ColumnDescPtr,
     data_type: ArrowType,
-    def_level_iter: Box<dyn Iterator<Item = i16> + 'a>,
-    rep_level_iter: Box<dyn Iterator<Item = i16> + 'a>,
+    def_level_iter_factory: SplittableBatchingIteratorFactory<'a, Result<BufferPtr<i16>>>,
+    rep_level_iter_factory: SplittableBatchingIteratorFactory<'a, Result<BufferPtr<i16>>>,
     value_iter_factory: SplittableBatchingIteratorFactory<'a, Result<(usize, ByteBufferPtr)>>,
-    last_def_levels: Option<Vec<i16>>,
+    last_def_levels: Option<Int16Array>,
+    last_rep_levels: Option<Int16Array>,
 }
 
 impl<'a> ArrowArrayReader<'a> {
@@ -300,10 +327,11 @@ impl<'a> ArrowArrayReader<'a> {
         Ok(Self {
             column_desc,
             data_type,
-            def_level_iter: Box::new(def_level_iter),
-            rep_level_iter: Box::new(rep_level_iter),
+            def_level_iter_factory: SplittableBatchingIteratorFactory::new(def_level_iter),
+            rep_level_iter_factory: SplittableBatchingIteratorFactory::new(rep_level_iter),
             value_iter_factory: SplittableBatchingIteratorFactory::new(value_iter),
             last_def_levels: None,
+            last_rep_levels: None,
         })
     }
 
@@ -317,15 +345,16 @@ impl<'a> ArrowArrayReader<'a> {
         column_desc.max_rep_level() > 0
     }
 
-    fn map_page_error(err: ParquetError) -> (Box<dyn Iterator<Item = Result<(usize, ByteBufferPtr)>>>, Box<dyn Iterator<Item = i16>>, Box<dyn Iterator<Item = i16>>)
+    fn map_page_error(err: ParquetError) -> (Box<dyn Iterator<Item = Result<(usize, ByteBufferPtr)>>>, Box<dyn Iterator<Item = Result<BufferPtr<i16>>>>, Box<dyn Iterator<Item = Result<BufferPtr<i16>>>>)
     {
-        (Box::new(std::iter::once(Err(err))), Box::new(std::iter::empty::<i16>()), Box::new(std::iter::empty::<i16>()))
+        (Box::new(std::iter::once(Err(err.clone()))), Box::new(std::iter::once(Err(err.clone()))), Box::new(std::iter::once(Err(err))))
     }
 
     // Split Result<Page> into Result<(Iterator<Values>, Iterator<DefLevels>, Iterator<RepLevels>)>
     // this method could fail, e.g. if the page encoding is not supported
-    fn map_page(page: Page, column_desc: &ColumnDescriptor) -> Result<(Box<dyn Iterator<Item = Result<(usize, ByteBufferPtr)>>>, Box<dyn Iterator<Item = i16>>, Box<dyn Iterator<Item = i16>>)> 
+    fn map_page(page: Page, column_desc: &ColumnDescriptor) -> Result<(Box<dyn Iterator<Item = Result<(usize, ByteBufferPtr)>>>, Box<dyn Iterator<Item = Result<BufferPtr<i16>>>>, Box<dyn Iterator<Item = Result<BufferPtr<i16>>>>)> 
     {
+        use crate::encodings::levels::LevelDecoder;
         // process page (V1, V2, Dictionary)
         match page {
             Page::DataPageV2 {
@@ -339,25 +368,40 @@ impl<'a> ArrowArrayReader<'a> {
                 is_compressed: _,
                 statistics: _,
             } => {
+                let mut offset = 0;
                 // create rep level decoder iterator
-                let rep_level_iter: Box<dyn Iterator<Item = i16>> = if Self::rep_levels_available(&column_desc) {
-                    // TODO: create actual rep level decoder iterator
-                    Box::new(Vec::<i16>::new().into_iter())
+                let rep_level_iter: Box<dyn Iterator<Item = Result<BufferPtr<i16>>>> = if Self::rep_levels_available(&column_desc) {
+                    let rep_levels_byte_len = rep_levels_byte_len as usize;
+                    let mut rep_decoder =
+                        LevelDecoder::v2(column_desc.max_rep_level());
+                    rep_decoder.set_data_range(
+                        num_values as usize,
+                        &buf,
+                        offset,
+                        rep_levels_byte_len,
+                    );
+                    offset += rep_levels_byte_len;
+                    Box::new(rep_decoder)
                 }
                 else {
-                    // is an empty iterator a good choice for rep levels?
-                    Box::new(std::iter::empty::<i16>())
+                    Box::new(std::iter::once(Err(ParquetError::General(format!("rep levels are not available")))))
                 };
                 // create def level decoder iterator
-                let def_level_iter: Box<dyn Iterator<Item = i16>> = if Self::def_levels_available(&column_desc) {
-                    // TODO: create actual def level decoder iterator
-                    Box::new(Vec::<i16>::new().into_iter())
+                let def_level_iter: Box<dyn Iterator<Item = Result<BufferPtr<i16>>>> = if Self::def_levels_available(&column_desc) {
+                    let def_levels_byte_len = def_levels_byte_len as usize;
+                    let mut def_decoder =
+                        LevelDecoder::v2(column_desc.max_rep_level());
+                    def_decoder.set_data_range(
+                        num_values as usize,
+                        &buf,
+                        offset,
+                        def_levels_byte_len,
+                    );
+                    offset += def_levels_byte_len;
+                    Box::new(def_decoder)
                 }
                 else {
-                    // create def level iterators where all values are included
-                    // so that if there are no def levels, then attempting to read def levels
-                    // will not buffer all value decoders
-                    Box::new(std::iter::repeat(column_desc.max_def_level()).take(num_values as usize))
+                    Box::new(std::iter::once(Err(ParquetError::General(format!("def levels are not available")))))
                 };
 
                 // create value decoder iterator
@@ -402,6 +446,20 @@ impl<'a> ArrowArrayReader<'a> {
             .build();
         Ok(array_data)
     }
+
+    fn build_level_array(level_buffers: Vec<BufferPtr<i16>>) -> Int16Array {
+        let value_count = level_buffers.iter().map(|levels| levels.len()).sum();
+        let values_byte_len = value_count * std::mem::size_of::<i16>();
+        let mut value_buffer = MutableBuffer::new(values_byte_len);
+        for level_buffer in level_buffers {
+            value_buffer.extend_from_slice(level_buffer.data());
+        }
+        let array_data = arrow::array::ArrayData::builder(ArrowType::Int16)
+            .len(value_count)
+            .add_buffer(value_buffer.into())
+            .build();
+        Int16Array::from(array_data)
+    }
 }
 
 impl ArrayReader for ArrowArrayReader<'static> {
@@ -414,6 +472,14 @@ impl ArrayReader for ArrowArrayReader<'static> {
     }
 
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
+        if Self::rep_levels_available(&self.column_desc) {
+            // read rep levels if available
+            let rep_level_iter = self.rep_level_iter_factory.get_batch_iter(batch_size);
+            let rep_level_buffers: Vec<BufferPtr<i16>> = rep_level_iter.collect::<Result<_>>()?;
+            let rep_level_array = Self::build_level_array(rep_level_buffers);
+            self.last_rep_levels = Some(rep_level_array);
+        }
+        
         // check if def levels are available
         let (values_to_read, null_bitmap_array) = if !Self::def_levels_available(&self.column_desc) {
             // if no def levels - just read (up to) batch_size values
@@ -421,25 +487,16 @@ impl ArrayReader for ArrowArrayReader<'static> {
         }
         else {
             // if def levels are available - they determine how many values will be read
-            let def_levels = self.def_level_iter
-                .by_ref()
-                .take(batch_size)
-                .collect::<Vec<_>>();
-            let def_level_count = def_levels.len();
-            let max_def_level = self.column_desc.max_def_level();
-            let null_bitmap_iter = def_levels.iter().map(|d| d == &max_def_level);
-            // use of from_trusted_len_iter_bool is safe because take() sets upper size hint
-            let null_bit_buffer: Buffer = unsafe { MutableBuffer::from_trusted_len_iter_bool(null_bitmap_iter).into() };
-            self.last_def_levels = Some(def_levels);
-            // it should be faster to use count_set_bits instead of incrementing during iteration
-            let values_to_read = null_bit_buffer.count_set_bits_offset(0, def_level_count);
-            let null_bitmap_array = {
-                let builder = arrow::array::ArrayData::builder(ArrowType::Boolean)
-                    .len(def_level_count)
-                    .add_buffer(null_bit_buffer);
-                let data = builder.build();
-                arrow::array::BooleanArray::from(data)
-            };
+            let def_level_iter = self.def_level_iter_factory.get_batch_iter(batch_size);
+            // decode def levels, return first error if any
+            let def_level_buffers: Vec<BufferPtr<i16>> = def_level_iter.collect::<Result<_>>()?;
+            let def_level_array = Self::build_level_array(def_level_buffers);
+            let def_level_count = def_level_array.len();
+            // use eq_scalar to efficiently build null bitmap array from def levels
+            let null_bitmap_array = arrow::compute::eq_scalar(&def_level_array, self.column_desc.max_def_level())?;
+            self.last_def_levels = Some(def_level_array);
+            // efficiently calculate values to read
+            let values_to_read = null_bitmap_array.values().count_set_bits_offset(0, def_level_count);
             (values_to_read, Some(null_bitmap_array))
         };
 
@@ -487,14 +544,11 @@ impl ArrayReader for ArrowArrayReader<'static> {
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.last_def_levels.as_deref()
+        self.last_def_levels.as_ref().map(|x| x.values())
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        if Self::rep_levels_available(&self.column_desc) {
-            // TODO: return actual rep levels
-        }
-        None
+        self.last_rep_levels.as_ref().map(|x| x.values())
     }
 }
 
