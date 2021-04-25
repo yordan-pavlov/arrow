@@ -292,6 +292,7 @@ impl<T> BufferPtr<T> {
     }
 
     /// Returns slice of data in this buffer.
+    #[inline]
     pub fn data(&self) -> &[T] {
         &self.data[self.start..self.start + self.len]
     }
@@ -319,6 +320,7 @@ impl<T> BufferPtr<T> {
     }
 
     /// Returns length of this buffer
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }

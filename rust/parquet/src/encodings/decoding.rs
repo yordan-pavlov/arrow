@@ -146,6 +146,115 @@ pub struct PlainDecoderDetails {
     pub(crate) bit_reader: Option<BitReader>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ValueByteChunk {
+    pub data: ByteBufferPtr,
+    pub value_count: usize,
+    pub value_bit_len: usize,
+    pub bit_offset: u8,
+}
+
+impl ValueByteChunk {
+    pub fn new(data: ByteBufferPtr, value_count: usize, value_bit_len: usize) -> Self {
+        Self {
+            data,
+            value_count,
+            value_bit_len,
+            bit_offset: 0,
+        }
+    }
+}
+
+pub(crate) struct FixedLenPlainDecoder {
+    data: ByteBufferPtr,
+    num_values: usize,
+    value_bit_len: usize,
+}
+
+impl FixedLenPlainDecoder {
+    pub(crate) fn new(data: ByteBufferPtr, num_values: usize, value_bit_len: usize) -> Self {
+        Self {
+            data,
+            num_values,
+            value_bit_len,
+        }
+    }
+}
+
+impl Iterator for FixedLenPlainDecoder {
+    type Item = Result<ValueByteChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::util::bit_util::ceil;
+        if self.num_values > 0 {
+            // calculate number of whole bytes to read
+            let byte_len = ceil((self.num_values * self.value_bit_len) as i64, 8) as usize;
+            if byte_len > self.data.len() {
+                return Some(Err(eof_err!("Not enough bytes to decode")));
+            }
+            self.num_values = 0;
+            // a single value chunk is returned, containing all values
+            let value_byte_chunk = ValueByteChunk::new(
+                self.data.range(0, byte_len),
+                self.num_values,
+                self.value_bit_len,
+            );
+            Some(Ok(value_byte_chunk))
+        }
+        else {
+            None
+        }
+    }
+}
+
+pub(crate) struct VariableLenPlainDecoder {
+    data: ByteBufferPtr,
+    num_values: usize,
+    position: usize,
+}
+
+impl VariableLenPlainDecoder {
+    pub(crate) fn new(data: ByteBufferPtr, num_values: usize) -> Self {
+        Self {
+            data,
+            num_values,
+            position: 0,
+        }
+    }
+}
+
+impl Iterator for VariableLenPlainDecoder {
+    type Item = Result<ValueByteChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const LEN_SIZE: usize = std::mem::size_of::<u32>();
+        let data_len = self.data.len();
+        if self.position < data_len && self.num_values > 0 {
+            let len: usize = 
+                read_num_bytes!(u32, LEN_SIZE, self.data.data()[self.position..])
+                as usize;
+            self.position += LEN_SIZE;
+
+            if data_len < self.position + len {
+                return Some(Err(eof_err!("Not enough bytes to decode")));
+            }
+            let value_bytes = self.data.range(self.position, len);
+            self.position += len;
+            self.num_values -= 1;
+            // variable length value chunks contain a single value each
+            let value_byte_chunk = ValueByteChunk::new(
+                value_bytes,
+                1,
+                0,
+            );
+            Some(Ok(value_byte_chunk))
+        }
+        else {
+            None
+        }
+    }
+}
+
 /// Plain decoding that supports all types.
 /// Values are encoded back to back. For native types, data is encoded as little endian.
 /// Floating point types are encoded in IEEE.
