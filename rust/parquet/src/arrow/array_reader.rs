@@ -1477,16 +1477,21 @@ impl<'a> ArrayReaderBuilder {
                             arrow_type,
                         )?))
                     } else {
-                        let converter = Utf8Converter::new(Utf8ArrayConverter {});
-                        Ok(Box::new(ComplexObjectArrayReader::<
-                            ByteArrayType,
-                            Utf8Converter,
-                        >::new(
-                            page_iterator,
-                            column_desc,
-                            converter,
-                            arrow_type,
+                        use crate::arrow::arrow_array_reader::{StringArrayConverter, ArrowArrayReader};
+                        let converter = StringArrayConverter::new();
+                        Ok(Box::new(ArrowArrayReader::try_new(
+                            *page_iterator, column_desc, converter, None
                         )?))
+                        // let converter = Utf8Converter::new(Utf8ArrayConverter {});
+                        // Ok(Box::new(ComplexObjectArrayReader::<
+                        //     ByteArrayType,
+                        //     Utf8Converter,
+                        // >::new(
+                        //     page_iterator,
+                        //     column_desc,
+                        //     converter,
+                        //     arrow_type,
+                        // )?))
                     }
                 } else if let Some(ArrowType::LargeBinary) = arrow_type {
                     let converter =
