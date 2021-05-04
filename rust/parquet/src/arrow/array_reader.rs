@@ -552,7 +552,7 @@ where
     T: DataType,
     C: Converter<Vec<Option<T::T>>, ArrayRef> + 'static,
 {
-    fn new(
+    pub fn new(
         pages: Box<dyn PageIterator>,
         column_desc: ColumnDescPtr,
         converter: C,
@@ -1480,7 +1480,7 @@ impl<'a> ArrayReaderBuilder {
                         use crate::arrow::arrow_array_reader::{StringArrayConverter, ArrowArrayReader};
                         let converter = StringArrayConverter::new();
                         Ok(Box::new(ArrowArrayReader::try_new(
-                            *page_iterator, column_desc, converter, None
+                            *page_iterator, column_desc, converter, arrow_type
                         )?))
                         // let converter = Utf8Converter::new(Utf8ArrayConverter {});
                         // Ok(Box::new(ComplexObjectArrayReader::<

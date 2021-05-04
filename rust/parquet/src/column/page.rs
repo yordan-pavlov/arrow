@@ -28,6 +28,7 @@ use crate::util::memory::ByteBufferPtr;
 /// List of supported pages.
 /// These are 1-to-1 mapped from the equivalent Thrift definitions, except `buf` which
 /// used to store uncompressed bytes of the page.
+#[derive(Clone)]
 pub enum Page {
     DataPage {
         buf: ByteBufferPtr,

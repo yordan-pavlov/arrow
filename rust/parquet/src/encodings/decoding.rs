@@ -147,7 +147,7 @@ pub struct PlainDecoderDetails {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ValueByteChunk {
+pub struct ValueByteChunk {
     pub data: ByteBufferPtr,
     pub value_count: usize,
     pub value_bit_len: usize,

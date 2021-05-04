@@ -292,11 +292,11 @@ impl Splittable for Result<ValueByteChunk> {
 
 type LevelBufferPtr = BufferPtr<i16>;
 
-pub(crate) trait ArrayConverter {
+pub trait ArrayConverter {
     fn convert_value_chunks(&self, value_byte_chunks: impl IntoIterator<Item = Result<ValueByteChunk>>) -> Result<arrow::array::ArrayData>;
 }
 
-pub(crate) struct ArrowArrayReader<'a, C: ArrayConverter + 'a> {
+pub struct ArrowArrayReader<'a, C: ArrayConverter + 'a> {
     column_desc: ColumnDescPtr,
     data_type: ArrowType,
     def_level_iter_factory: SplittableBatchingIteratorFactory<'a, Result<LevelBufferPtr>>,
@@ -320,14 +320,14 @@ impl ColumnChunkContext {
 }
 
 impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
-    pub(crate) fn try_new<P: PageIterator + 'a>(column_chunk_iterator: P, column_desc: ColumnDescPtr, array_converter: C, arrow_type: Option<ArrowType>) -> Result<Self> {
+    pub fn try_new<P: PageIterator + 'a>(column_chunk_iterator: P, column_desc: ColumnDescPtr, array_converter: C, arrow_type: Option<ArrowType>) -> Result<Self> {
         let data_type = match arrow_type {
             Some(t) => t,
             None => parquet_to_arrow_field(column_desc.as_ref())?
                 .data_type()
                 .clone(),
         };
-        
+        // println!("ArrowArrayReader::try_new, data_type: {}", data_type);
         let page_iter = column_chunk_iterator
             // build iterator of pages across column chunks
             .flat_map(|x| -> Box<dyn Iterator<Item = Result<(Page, Rc<RefCell<ColumnChunkContext>>)>>> {
@@ -784,10 +784,10 @@ impl Iterator for DictionaryDecoder {
     }
 }
 
-pub(crate) struct StringArrayConverter {}
+pub struct StringArrayConverter {}
 
 impl StringArrayConverter {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {}
     }
 }
@@ -873,15 +873,14 @@ mod tests {
         let schema = parse_message_type(message_type)
             .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
             .unwrap();
-
-        let max_def_level = schema.column(0).max_def_level();
-        let max_rep_level = schema.column(0).max_rep_level();
+        let column_desc = schema.column(0);
+        let max_def_level = column_desc.max_def_level();
+        let max_rep_level = column_desc.max_rep_level();
 
         assert_eq!(max_def_level, 2);
         assert_eq!(max_rep_level, 1);
 
         let mut rng = thread_rng();
-        let column_desc = schema.column(0);
         let mut pages: Vec<Vec<Page>> = Vec::new();
 
         let mut rep_levels = Vec::with_capacity(num_pages * values_per_page);
