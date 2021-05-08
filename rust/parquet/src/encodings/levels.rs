@@ -156,6 +156,8 @@ pub enum LevelDecoder {
 }
 
 impl LevelDecoder {
+    const BUFFER_SIZE: usize = 1024;
+
     /// Creates new level decoder based on encoding and max definition/repetition level.
     /// This method only initializes level decoder, `set_data` method must be called
     /// before reading any value.
@@ -238,14 +240,19 @@ impl LevelDecoder {
         }
     }
 
+    /// Returns an option containing the number of expected values, if set.
+    pub fn get_num_values(&self) -> &Option<usize> {
+        match self {
+            LevelDecoder::RLE(num_values, _) => num_values,
+            LevelDecoder::RLE_V2(num_values, _) => num_values,
+            LevelDecoder::BIT_PACKED(num_values, ..) => num_values,
+        }
+    }
+
     /// Returns true if data is set for decoder, false otherwise.
     #[inline]
     pub fn is_data_set(&self) -> bool {
-        match self {
-            LevelDecoder::RLE(ref num_values, _) => num_values.is_some(),
-            LevelDecoder::RLE_V2(ref num_values, _) => num_values.is_some(),
-            LevelDecoder::BIT_PACKED(ref num_values, ..) => num_values.is_some(),
-        }
+        self.get_num_values().is_some()
     }
 
     /// Decodes values and puts them into `buffer`.
@@ -281,13 +288,12 @@ impl Iterator for LevelDecoder {
     type Item = Result<crate::memory::BufferPtr<i16>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        const BUFFER_SIZE: usize = 1024;
-        let mut level_values = vec![0i16; BUFFER_SIZE];
+        let mut level_values = vec![0i16; LevelDecoder::BUFFER_SIZE];
         match self.get(&mut level_values) {
             Ok(values_read) => {
                 if values_read > 0 {
                     let mut buffer = crate::memory::BufferPtr::new(level_values);
-                    if values_read < BUFFER_SIZE {
+                    if values_read < LevelDecoder::BUFFER_SIZE {
                         // BufferPtr::with_range avoids an extra drop operation
                         buffer = buffer.with_range(0, values_read);
                     }
@@ -299,6 +305,13 @@ impl Iterator for LevelDecoder {
             },
             Err(e) => Some(Err(e)),
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let upper_size = self.get_num_values().map(
+            |x| ceil(x as i64, LevelDecoder::BUFFER_SIZE as i64) as usize
+        );
+        (0, upper_size)
     }
 }
 

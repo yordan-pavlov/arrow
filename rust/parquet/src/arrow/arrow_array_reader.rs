@@ -395,6 +395,10 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
     // this method could fail, e.g. if the page encoding is not supported
     fn map_page(page: Page, column_chunk_context: Rc<RefCell<ColumnChunkContext>>, column_desc: &ColumnDescriptor) -> Result<(Box<dyn Iterator<Item = Result<ValueByteChunk>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>)> 
     {
+        // println!(
+        //     "ArrowArrayReader::map_page, column: {:?}, page: {:?}, encoding: {:?}, num values: {:?}", 
+        //     column_desc.path(), page.page_type(), page.encoding(), page.num_values()
+        // );
         use crate::encodings::levels::LevelDecoder;
         match page {
             Page::DictionaryPage {
@@ -595,18 +599,23 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         Box::new(FixedLenPlainDecoder::new(values_buffer, num_values, value_bit_len))
     }
 
-    fn build_level_array(level_buffers: Vec<LevelBufferPtr>) -> Int16Array {
-        let value_count = level_buffers.iter().map(|levels| levels.len()).sum();
-        let values_byte_len = value_count * std::mem::size_of::<i16>();
+    fn build_level_array(level_buffers: impl IntoIterator<Item = Result<LevelBufferPtr>>) -> Result<Int16Array> {
+        let level_buffer_iter = level_buffers.into_iter();
+        // SplittableBatchingIterator returns batch_size as upper size hint
+        let value_count_hint = level_buffer_iter.size_hint().1.unwrap_or(0);
+        // println!("ArrowArrayReader::build_level_array, value_count_hint: {}", value_count_hint);
+        let value_size = std::mem::size_of::<i16>();
+        let values_byte_len = value_count_hint * value_size;
         let mut value_buffer = MutableBuffer::new(values_byte_len);
-        for level_buffer in level_buffers {
-            value_buffer.extend_from_slice(level_buffer.data());
+        for level_buffer in level_buffer_iter {
+            value_buffer.extend_from_slice(level_buffer?.data());
         }
+        let actual_value_count = value_buffer.len() / value_size;
         let array_data = arrow::array::ArrayData::builder(ArrowType::Int16)
-            .len(value_count)
+            .len(actual_value_count)
             .add_buffer(value_buffer.into())
             .build();
-        Int16Array::from(array_data)
+        Ok(Int16Array::from(array_data))
     }
 }
 
@@ -623,8 +632,7 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
         if Self::rep_levels_available(&self.column_desc) {
             // read rep levels if available
             let rep_level_iter = self.rep_level_iter_factory.get_batch_iter(batch_size);
-            let rep_level_buffers: Vec<LevelBufferPtr> = rep_level_iter.collect::<Result<_>>()?;
-            let rep_level_array = Self::build_level_array(rep_level_buffers);
+            let rep_level_array = Self::build_level_array(rep_level_iter)?;
             self.last_rep_levels = Some(rep_level_array);
         }
         
@@ -637,15 +645,21 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
             // if def levels are available - they determine how many values will be read
             let def_level_iter = self.def_level_iter_factory.get_batch_iter(batch_size);
             // decode def levels, return first error if any
-            let def_level_buffers: Vec<LevelBufferPtr> = def_level_iter.collect::<Result<_>>()?;
-            let def_level_array = Self::build_level_array(def_level_buffers);
+            let def_level_array = Self::build_level_array(def_level_iter)?;
             let def_level_count = def_level_array.len();
             // use eq_scalar to efficiently build null bitmap array from def levels
             let null_bitmap_array = arrow::compute::eq_scalar(&def_level_array, self.column_desc.max_def_level())?;
             self.last_def_levels = Some(def_level_array);
             // efficiently calculate values to read
             let values_to_read = null_bitmap_array.values().count_set_bits_offset(0, def_level_count);
-            (values_to_read, Some(null_bitmap_array))
+            let maybe_null_bitmap = if values_to_read != null_bitmap_array.len() {
+                Some(null_bitmap_array)
+            }
+            else {
+                // shortcut if no NULLs
+                None
+            };
+            (values_to_read, maybe_null_bitmap)
         };
 
         // read a batch of values
@@ -666,7 +680,6 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
             // This will require value bytes to be copied again, but converter requirements are reduced.
             // With a small number of NULLs, this will only be a few copies of large byte sequences.
             let actual_batch_size = null_bitmap_array.len();
-            // TODO: optimize MutableArrayData::extend_offsets for sequential slices
             // use_nulls is false, because null_bitmap_array is already calculated and re-used
             let mut mutable = arrow::array::MutableArrayData::new(vec![&value_array_data], false, actual_batch_size);
             // SlicesIterator slices only the true values, NULLs are inserted to fill any gaps
@@ -781,6 +794,10 @@ impl Iterator for DictionaryDecoder {
         //         Some(Ok(first_value))
         //     }
         // }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.num_values, Some(self.num_values))
     }
 }
 

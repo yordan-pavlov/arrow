@@ -205,6 +205,10 @@ impl Iterator for FixedLenPlainDecoder {
             None
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(1))
+    }
 }
 
 pub(crate) struct VariableLenPlainDecoder {
@@ -252,6 +256,10 @@ impl Iterator for VariableLenPlainDecoder {
         else {
             None
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.num_values, Some(self.num_values))
     }
 }
 

@@ -18,9 +18,10 @@ fn build_test_schema() -> SchemaDescPtr {
 }
 
 // test data params
-const NUM_ROW_GROUPS: usize = 2;
+const NUM_ROW_GROUPS: usize = 1;
 const PAGES_PER_GROUP: usize = 2;
-const VALUES_PER_PAGE: usize = 4_000;
+const VALUES_PER_PAGE: usize = 10_000;
+const BATCH_SIZE: usize = 8192;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -71,8 +72,8 @@ fn build_dictionary_encoded_string_page_iterator(schema: SchemaDescPtr, column_d
     let max_def_level = column_desc.max_def_level();
     let max_rep_level = column_desc.max_rep_level();
     let rep_levels = vec![max_rep_level; VALUES_PER_PAGE];
-    // generate 10% unique values
-    const NUM_UNIQUE_VALUES: usize = VALUES_PER_PAGE / 10;
+    // generate 1% unique values
+    const NUM_UNIQUE_VALUES: usize = VALUES_PER_PAGE / 100;
     let unique_values = 
         (0..NUM_UNIQUE_VALUES)
         .map(|x| format!("Dictionary value {}", x))
@@ -130,7 +131,6 @@ fn build_dictionary_encoded_string_page_iterator(schema: SchemaDescPtr, column_d
 
 fn bench_array_reader(mut array_reader: impl ArrayReader) -> usize {
     // test procedure: read data in batches of 8192 until no more data
-    const BATCH_SIZE: usize = 8192;
     let mut total_count = 0;
     loop {
         let array = array_reader.next_batch(BATCH_SIZE);
@@ -172,8 +172,14 @@ fn add_benches(c: &mut Criterion) {
     let optional_string_column_desc = schema.column(1);
     // println!("optional_string_column_desc: {:?}", optional_string_column_desc);
 
-    // string, plain encoded, no NULLs
     let plain_string_no_null_data = build_plain_encoded_string_page_iterator(schema.clone(), mandatory_string_column_desc.clone(), 0.0);
+    // group.bench_function("clone benchmark data", |b| b.iter(|| {
+    //     let data = plain_string_no_null_data.clone();
+    //     count = data.flatten().count();
+    // }));
+    // println!("read {} pages", count);
+
+    // string, plain encoded, no NULLs
     group.bench_function("read StringArray, plain encoded, mandatory, no NULLs - old", |b| b.iter(|| {
         let array_reader = create_complex_array_reader(plain_string_no_null_data.clone(), mandatory_string_column_desc.clone());
         count = bench_array_reader(array_reader);
