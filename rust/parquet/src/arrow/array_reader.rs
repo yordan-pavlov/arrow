@@ -1415,11 +1415,16 @@ impl<'a> ArrayReaderBuilder {
                         column_desc,
                     )?))
                 } else {
-                    Ok(Box::new(PrimitiveArrayReader::<Int32Type>::new(
-                        page_iterator,
-                        column_desc,
-                        arrow_type,
+                    use crate::arrow::arrow_array_reader::{Int32ArrayConverter, ArrowArrayReader};
+                    let converter = Int32ArrayConverter::new();
+                    Ok(Box::new(ArrowArrayReader::try_new(
+                        *page_iterator, column_desc, converter, arrow_type
                     )?))
+                    // Ok(Box::new(PrimitiveArrayReader::<Int32Type>::new(
+                    //     page_iterator,
+                    //     column_desc,
+                    //     arrow_type,
+                    // )?))
                 }
             }
             PhysicalType::INT64 => Ok(Box::new(PrimitiveArrayReader::<Int64Type>::new(

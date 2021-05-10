@@ -327,7 +327,7 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                 .data_type()
                 .clone(),
         };
-        // println!("ArrowArrayReader::try_new, data_type: {}", data_type);
+        // println!("ArrowArrayReader::try_new, column: {}, data_type: {}", column_desc.path(), data_type);
         let page_iter = column_chunk_iterator
             // build iterator of pages across column chunks
             .flat_map(|x| -> Box<dyn Iterator<Item = Result<(Page, Rc<RefCell<ColumnChunkContext>>)>>> {
@@ -396,7 +396,7 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
     fn map_page(page: Page, column_chunk_context: Rc<RefCell<ColumnChunkContext>>, column_desc: &ColumnDescriptor) -> Result<(Box<dyn Iterator<Item = Result<ValueByteChunk>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>)> 
     {
         // println!(
-        //     "ArrowArrayReader::map_page, column: {:?}, page: {:?}, encoding: {:?}, num values: {:?}", 
+        //     "ArrowArrayReader::map_page, column: {}, page: {:?}, encoding: {:?}, num values: {:?}", 
         //     column_desc.path(), page.page_type(), page.encoding(), page.num_values()
         // );
         use crate::encodings::levels::LevelDecoder;
@@ -559,11 +559,19 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         match encoding {
             Encoding::PLAIN => Ok(Self::get_plain_decoder_iterator(values_buffer, num_values, column_desc)),
             Encoding::RLE_DICTIONARY => {
-                // TODO: add support for fixed-length types
                 if column_chunk_context.borrow().dictionary_values.is_some() {
-                    Ok(Box::new(DictionaryDecoder::new(
-                        column_chunk_context, values_buffer, num_values
-                    )))
+                    let value_bit_len = Self::get_column_physical_bit_len(column_desc);
+                    let dictionary_decoder: Box<dyn Iterator<Item = Result<ValueByteChunk>>> = if value_bit_len == 0 {
+                        Box::new(VariableLenDictionaryDecoder::new(
+                            column_chunk_context, values_buffer, num_values
+                        ))
+                    }
+                    else {
+                        Box::new(FixedLenDictionaryDecoder::new(
+                            column_chunk_context, values_buffer, num_values, value_bit_len
+                        ))
+                    };
+                    Ok(dictionary_decoder)
                 }
                 else {
                     Err(general_err!(
@@ -579,24 +587,29 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         }
     }
 
-    fn get_plain_decoder_iterator(values_buffer: ByteBufferPtr, num_values: usize, column_desc: &ColumnDescriptor) -> Box<dyn Iterator<Item = Result<ValueByteChunk>>> {
-        use crate::encodings::decoding::{FixedLenPlainDecoder, VariableLenPlainDecoder};
+    fn get_column_physical_bit_len(column_desc: &ColumnDescriptor) -> usize {
         use crate::basic::Type as PhysicalType;
-
         // parquet only supports a limited number of physical types
         // later converters cast to a more specific arrow / logical type if necessary
-        let value_bit_len: usize = match column_desc.physical_type() {
+        match column_desc.physical_type() {
             PhysicalType::BOOLEAN => 1,
             PhysicalType::INT32 | PhysicalType::FLOAT => 32,
             PhysicalType::INT64 | PhysicalType::DOUBLE => 64,
             PhysicalType::INT96 => 96,
-            PhysicalType::BYTE_ARRAY => { 
-                return Box::new(VariableLenPlainDecoder::new(values_buffer, num_values));
-            },
+            PhysicalType::BYTE_ARRAY => 0,
             PhysicalType::FIXED_LEN_BYTE_ARRAY => column_desc.type_length() as usize * 8,
-        };
+        }
+    }
 
-        Box::new(FixedLenPlainDecoder::new(values_buffer, num_values, value_bit_len))
+    fn get_plain_decoder_iterator(values_buffer: ByteBufferPtr, num_values: usize, column_desc: &ColumnDescriptor) -> Box<dyn Iterator<Item = Result<ValueByteChunk>>> {
+        use crate::encodings::decoding::{FixedLenPlainDecoder, VariableLenPlainDecoder};
+        let value_bit_len = Self::get_column_physical_bit_len(column_desc);
+        if value_bit_len == 0 {
+            Box::new(VariableLenPlainDecoder::new(values_buffer, num_values))
+        }
+        else {
+            Box::new(FixedLenPlainDecoder::new(values_buffer, num_values, value_bit_len))
+        }
     }
 
     fn build_level_array(level_buffers: impl IntoIterator<Item = Result<LevelBufferPtr>>) -> Result<Int16Array> {
@@ -663,6 +676,7 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
         };
 
         // read a batch of values
+        // println!("ArrowArrayReader::next_batch, batch_size: {}, values_to_read: {}", batch_size, values_to_read);
         let value_iter = self.value_iter_factory.get_batch_iter(values_to_read);
         
         // NOTE: collecting value chunks here is actually slower
@@ -704,8 +718,12 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
                 .null_bit_buffer(null_bitmap_array.values().clone())
                 .build();
         }
-        // TODO: cast array to self.data_type if necessary
-        Ok(arrow::array::make_array(value_array_data))
+        let mut array = arrow::array::make_array(value_array_data);
+        if array.data_type() != &self.data_type {
+            // cast array to self.data_type if necessary
+            array = arrow::compute::cast(&array, &self.data_type)?
+        }
+        Ok(array)
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
@@ -719,7 +737,92 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
 
 use crate::encodings::rle::RleDecoder;
 
-pub(crate) struct DictionaryDecoder {
+pub(crate) struct FixedLenDictionaryDecoder {
+    context_ref: Rc<RefCell<ColumnChunkContext>>,
+    key_data_bufer: ByteBufferPtr,
+    num_values: usize,
+    rle_decoder: RleDecoder,
+    value_byte_len: usize,
+    keys_buffer: Vec<i32>,
+}
+
+impl FixedLenDictionaryDecoder {
+    pub(crate) fn new(column_chunk_context: Rc<RefCell<ColumnChunkContext>>, key_data_bufer: ByteBufferPtr, num_values: usize, value_bit_len: usize) -> Self {
+        assert!(value_bit_len % 8 == 0, "value_bit_size must be a multiple of 8");
+        // First byte in `data` is bit width
+        let bit_width = key_data_bufer.data()[0];
+        let mut rle_decoder = RleDecoder::new(bit_width);
+        rle_decoder.set_data(key_data_bufer.start_from(1));
+        
+        Self {
+            context_ref: column_chunk_context,
+            key_data_bufer,
+            num_values,
+            rle_decoder,
+            value_byte_len: value_bit_len / 8,
+            keys_buffer: vec![0; 2048],
+        }
+    }
+}
+
+impl Iterator for FixedLenDictionaryDecoder {
+    type Item = Result<ValueByteChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.num_values <= 0 {
+            return None;
+        }
+        let values_to_read = std::cmp::min(self.num_values, self.keys_buffer.len());
+        let keys_read = match self.rle_decoder.get_batch(&mut self.keys_buffer[..values_to_read]) {
+            Ok(keys_read) => keys_read,
+            Err(e) => return Some(Err(e)),
+        };
+        if keys_read == 0 {
+            self.num_values = 0;
+            return None;
+        }
+        let context = self.context_ref.borrow();
+        let values = context.dictionary_values.as_ref().unwrap();
+        let value_byte_chunk = &values[0];
+        assert!(value_byte_chunk.value_bit_len == self.value_byte_len * 8);
+        let input_value_bytes = value_byte_chunk.data.data();
+        let mut output_value_bytes = vec![0u8; keys_read * self.value_byte_len];
+        // TODO: test another way to initialize / allocate memory
+        // let mut output_value_bytes = unsafe {
+        //     let size = keys_read * self.value_byte_len;
+        //     let layout = std::alloc::Layout::from_size_align_unchecked(size, arrow::alloc::ALIGNMENT);
+        //     let output_bytes = std::alloc::alloc(layout);
+        //     if output_bytes.is_null() {
+        //         std::alloc::handle_alloc_error(layout);
+        //     }
+        //     Vec::from_raw_parts(output_bytes, size, size)
+        // };
+        for i in 0..keys_read {
+            let key = self.keys_buffer[i] as usize;
+            output_value_bytes[i * self.value_byte_len..(i + 1) * self.value_byte_len]
+                .copy_from_slice(&input_value_bytes[key * self.value_byte_len..(key + 1) * self.value_byte_len]);
+            
+            // output_value_bytes[i * self.value_byte_len..][..self.value_byte_len]
+            //     .copy_from_slice(&input_value_bytes[key * self.value_byte_len..][..self.value_byte_len]);
+            
+            // unsafe {
+            //     std::ptr::copy_nonoverlapping(
+            //         input_value_bytes[key * self.value_byte_len..].as_ptr(),
+            //         output_value_bytes[i * self.value_byte_len..].as_mut_ptr(),
+            //         self.value_byte_len
+            //     )
+            // }
+        }
+        self.num_values -= keys_read;
+        Some(Ok(ValueByteChunk::new(
+            ByteBufferPtr::new(output_value_bytes), 
+            keys_read, 
+            self.value_byte_len * 8
+        )))
+    }
+}
+
+pub(crate) struct VariableLenDictionaryDecoder {
     context_ref: Rc<RefCell<ColumnChunkContext>>,
     key_data_bufer: ByteBufferPtr,
     num_values: usize,
@@ -728,7 +831,7 @@ pub(crate) struct DictionaryDecoder {
     // keys_buffer: Vec<i32>,
 }
 
-impl DictionaryDecoder {
+impl VariableLenDictionaryDecoder {
     pub(crate) fn new(column_chunk_context: Rc<RefCell<ColumnChunkContext>>, key_data_bufer: ByteBufferPtr, num_values: usize) -> Self {
         // First byte in `data` is bit width
         let bit_width = key_data_bufer.data()[0];
@@ -746,7 +849,7 @@ impl DictionaryDecoder {
     }
 }
 
-impl Iterator for DictionaryDecoder {
+impl Iterator for VariableLenDictionaryDecoder {
     type Item = Result<ValueByteChunk>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -798,6 +901,38 @@ impl Iterator for DictionaryDecoder {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.num_values, Some(self.num_values))
+    }
+}
+
+pub struct Int32ArrayConverter {}
+
+impl Int32ArrayConverter {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl ArrayConverter for Int32ArrayConverter {
+    fn convert_value_chunks(&self, value_byte_chunks: impl IntoIterator<Item = Result<ValueByteChunk>>) -> Result<arrow::array::ArrayData> {
+        let value_chunks_iter = value_byte_chunks.into_iter();
+        // SplittableBatchingIterator returns batch_size as upper size hint
+        let value_capacity = value_chunks_iter.size_hint().1
+            .ok_or_else(|| ParquetError::ArrowError("Int32ArrayConverter expects input iterator to declare an upper size hint.".to_string()))?;
+        let value_size = std::mem::size_of::<i32>();
+        let values_byte_capacity = value_capacity * value_size;
+        let mut values_buffer = MutableBuffer::new(values_byte_capacity);
+
+        for value_chunk in value_chunks_iter {
+            values_buffer.extend_from_slice(value_chunk?.data.data());
+        }
+
+        // calculate actual data_len, which may be different from the iterator's upper bound
+        let value_count = values_buffer.len() / value_size;
+        let array_data = arrow::array::ArrayData::builder(ArrowType::Int32)
+            .len(value_count)
+            .add_buffer(values_buffer.into())
+            .build();
+        Ok(array_data)
     }
 }
 
@@ -860,7 +995,7 @@ impl ArrayConverter for StringArrayConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basic::{Encoding};
+    use crate::{basic::{Encoding}, column::page::PageReader, schema::types::SchemaDescPtr};
     use crate::column::page::{Page};
     use crate::data_type::{ByteArray};
     use crate::data_type::{ByteArrayType};
@@ -869,12 +1004,273 @@ mod tests {
     use crate::util::test_common::page_util::{
         DataPageBuilder, DataPageBuilderImpl, InMemoryPageIterator,
     };
-    use arrow::array::{StringArray};
-    use rand::{thread_rng, Rng};
+    use arrow::array::{PrimitiveArray, StringArray};
+    use arrow::datatypes::{Int32Type as ArrowInt32};
+    use rand::{Rng, distributions::uniform::SampleUniform, thread_rng};
     use std::sync::Arc;
 
+    /// Iterator for testing reading empty columns
+    struct EmptyPageIterator {
+        schema: SchemaDescPtr,
+    }
+
+    impl EmptyPageIterator {
+        fn new(schema: SchemaDescPtr) -> Self {
+            EmptyPageIterator { schema }
+        }
+    }
+
+    impl Iterator for EmptyPageIterator {
+        type Item = Result<Box<dyn PageReader>>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+
+    impl PageIterator for EmptyPageIterator {
+        fn schema(&mut self) -> Result<SchemaDescPtr> {
+            Ok(self.schema.clone())
+        }
+
+        fn column_schema(&mut self) -> Result<ColumnDescPtr> {
+            Ok(self.schema.column(0))
+        }
+    }
+
     #[test]
-    fn test_arrow_array_reader() {
+    fn test_array_reader_empty_pages() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+          REQUIRED INT32 leaf;
+        }
+        ";
+
+        let schema = parse_message_type(message_type)
+            .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
+            .unwrap();
+
+        let column_desc = schema.column(0);
+        let page_iterator = EmptyPageIterator::new(schema);
+
+        let converter = Int32ArrayConverter::new();
+        let mut array_reader = ArrowArrayReader::try_new(
+            page_iterator, column_desc, converter, None
+        ).unwrap();
+
+        // expect no values to be read
+        let array = array_reader.next_batch(50).unwrap();
+        assert!(array.is_empty());
+    }
+
+    fn make_column_chunks<T: crate::data_type::DataType>(
+        column_desc: ColumnDescPtr,
+        encoding: Encoding,
+        num_levels: usize,
+        min_value: T::T,
+        max_value: T::T,
+        def_levels: &mut Vec<i16>,
+        rep_levels: &mut Vec<i16>,
+        values: &mut Vec<T::T>,
+        page_lists: &mut Vec<Vec<Page>>,
+        use_v2: bool,
+        num_chunks: usize,
+    ) where
+        T::T: PartialOrd + SampleUniform + Copy,
+    {
+        for _i in 0..num_chunks {
+            let mut pages = VecDeque::new();
+            let mut data = Vec::new();
+            let mut page_def_levels = Vec::new();
+            let mut page_rep_levels = Vec::new();
+
+            crate::util::test_common::make_pages::<T>(
+                column_desc.clone(),
+                encoding,
+                1,
+                num_levels,
+                min_value,
+                max_value,
+                &mut page_def_levels,
+                &mut page_rep_levels,
+                &mut data,
+                &mut pages,
+                use_v2,
+            );
+
+            def_levels.append(&mut page_def_levels);
+            rep_levels.append(&mut page_rep_levels);
+            values.append(&mut data);
+            page_lists.push(Vec::from(pages));
+        }
+    }
+
+    #[test]
+    fn test_primitive_array_reader_data() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+          REQUIRED INT32 leaf;
+        }
+        ";
+
+        let schema = parse_message_type(message_type)
+            .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
+            .unwrap();
+
+        let column_desc = schema.column(0);
+
+        // Construct page iterator
+        {
+            let mut data = Vec::new();
+            let mut page_lists = Vec::new();
+            make_column_chunks::<crate::data_type::Int32Type>(
+                column_desc.clone(),
+                Encoding::PLAIN,
+                100,
+                1,
+                200,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut data,
+                &mut page_lists,
+                true,
+                2,
+            );
+            let page_iterator =
+                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+
+            let converter = Int32ArrayConverter::new();
+            let mut array_reader = ArrowArrayReader::try_new(
+                page_iterator, column_desc, converter, None
+            ).unwrap();
+
+            // Read first 50 values, which are all from the first column chunk
+            let array = array_reader.next_batch(50).unwrap();
+            let array = array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<ArrowInt32>>()
+                .unwrap();
+
+            assert_eq!(
+                &PrimitiveArray::<ArrowInt32>::from(data[0..50].to_vec()),
+                array
+            );
+
+            // Read next 100 values, the first 50 ones are from the first column chunk,
+            // and the last 50 ones are from the second column chunk
+            let array = array_reader.next_batch(100).unwrap();
+            let array = array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<ArrowInt32>>()
+                .unwrap();
+
+            assert_eq!(
+                &PrimitiveArray::<ArrowInt32>::from(data[50..150].to_vec()),
+                array
+            );
+
+            // Try to read 100 values, however there are only 50 values
+            let array = array_reader.next_batch(100).unwrap();
+            let array = array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<ArrowInt32>>()
+                .unwrap();
+
+            assert_eq!(
+                &PrimitiveArray::<ArrowInt32>::from(data[150..200].to_vec()),
+                array
+            );
+        }
+    }
+
+    #[test]
+    fn test_primitive_array_reader_def_and_rep_levels() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+            REPEATED Group test_mid {
+                OPTIONAL INT32 leaf;
+            }
+        }
+        ";
+
+        let schema = parse_message_type(message_type)
+            .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
+            .unwrap();
+
+        let column_desc = schema.column(0);
+
+        // Construct page iterator
+        {
+            let mut def_levels = Vec::new();
+            let mut rep_levels = Vec::new();
+            let mut page_lists = Vec::new();
+            make_column_chunks::<crate::data_type::Int32Type>(
+                column_desc.clone(),
+                Encoding::PLAIN,
+                100,
+                1,
+                200,
+                &mut def_levels,
+                &mut rep_levels,
+                &mut Vec::new(),
+                &mut page_lists,
+                true,
+                2,
+            );
+
+            let page_iterator =
+                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+
+            let converter = Int32ArrayConverter::new();
+            let mut array_reader = ArrowArrayReader::try_new(
+                page_iterator, column_desc, converter, None
+            ).unwrap();
+
+            let mut accu_len: usize = 0;
+
+            // Read first 50 values, which are all from the first column chunk
+            let array = array_reader.next_batch(50).unwrap();
+            assert_eq!(
+                Some(&def_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_def_levels()
+            );
+            assert_eq!(
+                Some(&rep_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_rep_levels()
+            );
+            accu_len += array.len();
+
+            // Read next 100 values, the first 50 ones are from the first column chunk,
+            // and the last 50 ones are from the second column chunk
+            let array = array_reader.next_batch(100).unwrap();
+            assert_eq!(
+                Some(&def_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_def_levels()
+            );
+            assert_eq!(
+                Some(&rep_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_rep_levels()
+            );
+            accu_len += array.len();
+
+            // Try to read 100 values, however there are only 50 values
+            let array = array_reader.next_batch(100).unwrap();
+            assert_eq!(
+                Some(&def_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_def_levels()
+            );
+            assert_eq!(
+                Some(&rep_levels[accu_len..(accu_len + array.len())]),
+                array_reader.get_rep_levels()
+            );
+        }
+    }
+
+    #[test]
+    fn test_arrow_array_reader_string() {
         // Construct column schema
         let message_type = "
         message test_schema {

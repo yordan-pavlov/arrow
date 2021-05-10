@@ -185,20 +185,19 @@ impl Iterator for FixedLenPlainDecoder {
     type Item = Result<ValueByteChunk>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use crate::util::bit_util::ceil;
         if self.num_values > 0 {
-            // calculate number of whole bytes to read
-            let byte_len = ceil((self.num_values * self.value_bit_len) as i64, 8) as usize;
-            if byte_len > self.data.len() {
-                return Some(Err(eof_err!("Not enough bytes to decode")));
-            }
-            self.num_values = 0;
+            // calculate number of values to read
+            let available_values = self.data.len() * 8 / self.value_bit_len;
+            // do not read more than num_values
+            let actual_num_values = cmp::min(available_values, self.num_values);
+            let byte_len = actual_num_values * self.value_bit_len / 8;
             // a single value chunk is returned, containing all values
             let value_byte_chunk = ValueByteChunk::new(
                 self.data.range(0, byte_len),
-                self.num_values,
+                actual_num_values,
                 self.value_bit_len,
             );
+            self.num_values = 0;
             Some(Ok(value_byte_chunk))
         }
         else {
