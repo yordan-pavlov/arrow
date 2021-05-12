@@ -786,33 +786,14 @@ impl Iterator for FixedLenDictionaryDecoder {
         let value_byte_chunk = &values[0];
         assert!(value_byte_chunk.value_bit_len == self.value_byte_len * 8);
         let input_value_bytes = value_byte_chunk.data.data();
+
         let mut output_value_bytes = vec![0u8; keys_read * self.value_byte_len];
-        // TODO: test another way to initialize / allocate memory
-        // let mut output_value_bytes = unsafe {
-        //     let size = keys_read * self.value_byte_len;
-        //     let layout = std::alloc::Layout::from_size_align_unchecked(size, arrow::alloc::ALIGNMENT);
-        //     let output_bytes = std::alloc::alloc(layout);
-        //     if output_bytes.is_null() {
-        //         std::alloc::handle_alloc_error(layout);
-        //     }
-        //     Vec::from_raw_parts(output_bytes, size, size)
-        // };
         for i in 0..keys_read {
             let key = self.keys_buffer[i] as usize;
-            output_value_bytes[i * self.value_byte_len..(i + 1) * self.value_byte_len]
-                .copy_from_slice(&input_value_bytes[key * self.value_byte_len..(key + 1) * self.value_byte_len]);
-            
-            // output_value_bytes[i * self.value_byte_len..][..self.value_byte_len]
-            //     .copy_from_slice(&input_value_bytes[key * self.value_byte_len..][..self.value_byte_len]);
-            
-            // unsafe {
-            //     std::ptr::copy_nonoverlapping(
-            //         input_value_bytes[key * self.value_byte_len..].as_ptr(),
-            //         output_value_bytes[i * self.value_byte_len..].as_mut_ptr(),
-            //         self.value_byte_len
-            //     )
-            // }
+            output_value_bytes[i * self.value_byte_len..][..self.value_byte_len]
+                .copy_from_slice(&input_value_bytes[key * self.value_byte_len..][..self.value_byte_len]);
         }
+
         self.num_values -= keys_read;
         Some(Ok(ValueByteChunk::new(
             ByteBufferPtr::new(output_value_bytes), 
