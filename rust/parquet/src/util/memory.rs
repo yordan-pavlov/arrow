@@ -300,12 +300,20 @@ impl<T> BufferPtr<T> {
     /// Updates this buffer with new `start` position and length `len`.
     ///
     /// Range should be within current start position and length.
+    #[inline]
     pub fn with_range(mut self, start: usize, len: usize) -> Self {
-        assert!(start <= self.len);
-        assert!(start + len <= self.len);
+        self.set_range(start, len);
+        self
+    }
+
+    /// Updates this buffer with new `start` position and length `len`.
+    ///
+    /// Range should be within current start position and length.
+    #[inline]
+    pub fn set_range(&mut self, start: usize, len: usize) {
+        assert!(self.start <= start && start + len <= self.start + self.len);
         self.start = start;
         self.len = len;
-        self
     }
 
     /// Adds memory tracker to this buffer.
@@ -315,6 +323,7 @@ impl<T> BufferPtr<T> {
     }
 
     /// Returns start position of this buffer.
+    #[inline]
     pub fn start(&self) -> usize {
         self.start
     }
@@ -409,6 +418,7 @@ impl<T> Drop for BufferPtr<T> {
 }
 
 impl AsRef<[u8]> for BufferPtr<u8> {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
         &self.data[self.start..self.start + self.len]
     }

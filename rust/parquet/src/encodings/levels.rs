@@ -295,7 +295,7 @@ impl Iterator for LevelDecoder {
                     let mut buffer = crate::memory::BufferPtr::new(level_values);
                     if values_read < LevelDecoder::BUFFER_SIZE {
                         // BufferPtr::with_range avoids an extra drop operation
-                        buffer = buffer.with_range(0, values_read);
+                        buffer.set_range(0, values_read);
                     }
                     Some(Ok(buffer))
                 }
