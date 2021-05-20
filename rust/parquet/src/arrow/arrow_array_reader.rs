@@ -1096,7 +1096,7 @@ pub(crate) struct VariableLenDictionaryDecoder {
     num_values: usize,
     rle_decoder: RleDecoder,
     // value_buffer: VecDeque<ValueByteChunk>,
-    // keys_buffer: Vec<i32>,
+    keys_buffer: Vec<i32>,
 }
 
 impl VariableLenDictionaryDecoder {
@@ -1112,7 +1112,7 @@ impl VariableLenDictionaryDecoder {
             num_values,
             rle_decoder,
             // value_buffer: VecDeque::with_capacity(128),
-            // keys_buffer: vec![0; 128],
+            keys_buffer: vec![0; 2048],
         }
     }
 }
@@ -1127,19 +1127,22 @@ impl ValueDecoder for VariableLenDictionaryDecoder {
         let values_to_read = std::cmp::min(self.num_values, num_values);
         let mut values_read = 0;
         while values_read < values_to_read {
-            let value_index = match self.rle_decoder.get::<i32>() {
-                Ok(maybe_key) => match maybe_key {
-                    Some(key) => key,
-                    None => {
-                        self.num_values = 0;
-                        return Ok(values_read);
-                    }
-                }
+            // read values in batches of up to self.keys_buffer.len()
+            let keys_to_read = std::cmp::min(values_to_read - values_read, self.keys_buffer.len());
+            let keys_read = match self.rle_decoder.get_batch(&mut self.keys_buffer[..keys_to_read]) {
+                Ok(keys_read) => keys_read,
                 Err(e) => return Err(e),
             };
-            let value_chunk = &value_chunks[value_index as usize];
-            read_bytes(value_chunk.data.data(), 1);
-            values_read += 1;
+            if keys_read == 0 {
+                self.num_values = 0;
+                return Ok(values_read);
+            }
+            for i in 0..keys_read {
+                let key = self.keys_buffer[i] as usize;
+                let value_chunk = &value_chunks[key];
+                read_bytes(value_chunk.data.data(), 1);
+            }
+            values_read += keys_read;
         }
         self.num_values -= values_read;
         Ok(values_read)
