@@ -1,7 +1,7 @@
-use std::{any::Any, collections::VecDeque};
+use std::{any::Any, collections::VecDeque, marker::PhantomData};
 use std::{rc::Rc, cell::RefCell};
-use arrow::{array::{ArrayRef, Int16Array}, buffer::MutableBuffer, datatypes::{DataType as ArrowType}};
-use crate::{column::page::{Page, PageIterator}, memory::{ByteBufferPtr, BufferPtr}, schema::types::{ColumnDescPtr, ColumnDescriptor}};
+use arrow::{array::{ArrayRef, Int16Array}, buffer::MutableBuffer, datatypes::{DataType as ArrowType, ToByteSlice}};
+use crate::{column::page::{Page, PageIterator}, memory::ByteBufferPtr, schema::types::{ColumnDescPtr, ColumnDescriptor}};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::errors::{ParquetError, Result};
 use crate::basic::Encoding;
@@ -109,206 +109,6 @@ fn unzip_iter<V, L, It: Iterator<Item = (V, L, L)>>(it: It) -> (
     (value_iter, def_level_iter, rep_level_iter)
 }
 
-pub trait Splittable {
-    type BufferType: Splittable<BufferType = Self::BufferType>;
-    type OutputType;
-
-    fn len(&self) -> usize;
-    fn split(self, len: usize) -> (Self::BufferType, Self::BufferType);
-}
-
-pub struct SplittableBatchingIteratorFactory<'iter, T: Splittable> {
-    source_iter: Box<dyn Iterator<Item = T> + 'iter>,
-    buffer_item: Option<T::BufferType>,
-}
-
-impl<'iter, T: Splittable + 'iter> SplittableBatchingIteratorFactory<'iter, T>
-{
-    pub fn new(source_iter: impl IntoIterator<Item = T> + 'iter) -> Self {
-        Self {
-            source_iter: Box::new(source_iter.into_iter()),
-            buffer_item: None,
-        }
-    }
-
-    // fn get_batch_iter<'a>(&'a mut self, batch_size: usize) -> impl Iterator<Item = Box<dyn AsRef<[u8]> + 'iter>> +'a {
-    pub fn get_batch_iter<'a>(&'a mut self, batch_size: usize) -> SplittableBatchingIterator<'iter, 'a, T> {
-        SplittableBatchingIterator::new(self, batch_size)
-    }
-}
-
-pub struct SplittableBatchingIterator<'iter, 'a, T: Splittable> {
-    source_state: &'a mut SplittableBatchingIteratorFactory<'iter, T>,
-    batch_size: usize,
-    iter_pos: usize,
-}
-
-impl<'iter, 'a, T: Splittable> SplittableBatchingIterator<'iter, 'a, T> {
-    fn new(source_state: &'a mut SplittableBatchingIteratorFactory<'iter, T>, batch_size: usize) -> Self {
-        Self {
-            source_state,
-            batch_size,
-            iter_pos: 0,
-        }
-    }
-}
-
-pub trait Convert<T>: Sized {
-    /// Performs the conversion.
-    fn convert(self) -> T;
-}
-
-impl<T> Convert<T> for T {
-    #[inline]
-    fn convert(self) -> T {
-        self
-    }
-}
-
-impl<'iter, 'a, I: Splittable + 'iter> Iterator for SplittableBatchingIterator<'iter, 'a, I>
-where
-    I: Convert<I::OutputType>, 
-    I::BufferType: Convert<I::OutputType>,
-{
-    type Item = I::OutputType;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let items_left = self.batch_size - self.iter_pos;
-        if items_left <= 0 {
-            return None;
-        }
-        
-        if self.source_state.buffer_item.is_some()  {
-            // if buffered item is some
-            let buffer_item = std::mem::replace(&mut self.source_state.buffer_item, None).unwrap();
-            let buffered_len = buffer_item.len();
-            let byte_buffer = if buffered_len <= items_left {
-                // consume buffered item fully
-                self.iter_pos += buffered_len;
-                buffer_item
-            }
-            else {
-                // consume buffered item partially
-                self.iter_pos += items_left;
-                let (result, buffer_item) = buffer_item.split(items_left);
-                self.source_state.buffer_item = Some(buffer_item);
-                result
-            };
-            return Some(byte_buffer.convert());
-        }
-        
-        if let Some(byte_slice) = self.source_state.source_iter.next() {
-            let slice_len = byte_slice.len();
-            // else if there are more items in source iterator
-            let result_slice = if slice_len <= items_left {
-                // consume source iterator item fully
-                self.iter_pos += slice_len;
-                byte_slice.convert()
-            }
-            else {
-                // consume source iterator item partially
-                let (result_slice, buffered_item) = byte_slice.split(items_left);
-                self.source_state.buffer_item = Some(buffered_item);
-                self.iter_pos += items_left;
-                result_slice.convert()
-            };
-            return Some(result_slice);
-        }
-
-        // source iterator exhausted
-        return None;
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.batch_size))
-    }
-}
-
-impl<T: Clone> Splittable for Result<BufferPtr<T>> {
-    type BufferType = Result<BufferPtr<T>>;
-    type OutputType = Result<BufferPtr<T>>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Ok(x) => x.len(),
-            _ => 0
-        }
-    }
-
-    #[inline]
-    fn split(self, len: usize) -> (Self::BufferType, Self::BufferType) {
-        let mut buffer = if let Ok(item) = self {
-            item
-        }
-        else {
-            // this shouldn't happen as len() returns 0 for error
-            // so it should always be fully consumed and never split
-            return (self.clone(), self);
-        };
-        (Ok(buffer.split_to( len)), Ok(buffer))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ValueByteChunk {
-    pub data: ByteBufferPtr,
-    pub value_count: usize,
-    pub value_bit_len: usize,
-    pub bit_offset: u8,
-}
-
-impl ValueByteChunk {
-    pub fn new(data: ByteBufferPtr, value_count: usize, value_bit_len: usize) -> Self {
-        Self {
-            data,
-            value_count,
-            value_bit_len,
-            bit_offset: 0,
-        }
-    }
-}
-
-impl Splittable for Result<ValueByteChunk> {
-    type BufferType = Result<ValueByteChunk>;
-    type OutputType = Result<ValueByteChunk>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Ok(x) => x.value_count,
-            _ => 0
-        }
-    }
-
-    #[inline]
-    fn split(self, len: usize) -> (Self::BufferType, Self::BufferType) {
-        let mut value_byte_chunk = if let Ok(item) = self {
-            item
-        }
-        else {
-            // this shouldn't happen as len() returns 0 for error
-            // so it should always be fully consumed and never split
-            return (self.clone(), self);
-        };
-        let value_bit_len = value_byte_chunk.value_bit_len;
-        let bit_len = len * value_bit_len;
-        // TODO: use bit_offset when splitting bit / bool values
-        assert!(bit_len % 8 == 0, "value byte buffer can only be split into whole bytes");
-        let byte_len = bit_len / 8;
-
-        let split_value_chunk = ValueByteChunk::new(
-            value_byte_chunk.data.split_to(byte_len),
-                len,
-                value_bit_len,
-        );
-        value_byte_chunk.value_count -= len;
-        (Ok(split_value_chunk), Ok(value_byte_chunk))
-    }
-}
-
-type LevelBufferPtr = BufferPtr<i16>;
-
 pub trait ArrayConverter {
     fn convert_value_bytes(&self, value_decoder: &mut impl ValueDecoder, num_values: usize) -> Result<arrow::array::ArrayData>;
 }
@@ -316,8 +116,8 @@ pub trait ArrayConverter {
 pub struct ArrowArrayReader<'a, C: ArrayConverter + 'a> {
     column_desc: ColumnDescPtr,
     data_type: ArrowType,
-    def_level_iter_factory: SplittableBatchingIteratorFactory<'a, Result<LevelBufferPtr>>,
-    rep_level_iter_factory: SplittableBatchingIteratorFactory<'a, Result<LevelBufferPtr>>,
+    def_level_decoder: Box<dyn ValueDecoder + 'a>,
+    rep_level_decoder: Box<dyn ValueDecoder + 'a>,
     value_decoder: Box<dyn ValueDecoder + 'a>,
     last_def_levels: Option<Int16Array>,
     last_rep_levels: Option<Int16Array>,
@@ -381,14 +181,12 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
             });
         // split tuple iterator into separate iterators for (values, def levels, rep levels)
         let (value_iter, def_level_iter, rep_level_iter) = unzip_iter(decoder_iter);
-        let def_level_iter = def_level_iter.flat_map(|x| x.into_iter());
-        let rep_level_iter = rep_level_iter.flat_map(|x| x.into_iter());
         
         Ok(Self {
             column_desc,
             data_type,
-            def_level_iter_factory: SplittableBatchingIteratorFactory::new(def_level_iter),
-            rep_level_iter_factory: SplittableBatchingIteratorFactory::new(rep_level_iter),
+            def_level_decoder: Box::new(CompositeValueDecoder::new(def_level_iter)),
+            rep_level_decoder: Box::new(CompositeValueDecoder::new(rep_level_iter)),
             value_decoder: Box::new(CompositeValueDecoder::new(value_iter)),
             last_def_levels: None,
             last_rep_levels: None,
@@ -406,14 +204,18 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         column_desc.max_rep_level() > 0
     }
 
-    fn map_page_error(err: ParquetError) -> (Box<dyn ValueDecoder>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>)
+    fn map_page_error(err: ParquetError) -> (Box<dyn ValueDecoder>, Box<dyn ValueDecoder>, Box<dyn ValueDecoder>)
     {
-        (Box::new(<dyn ValueDecoder>::once(Err(err.clone()))), Box::new(std::iter::once(Err(err.clone()))), Box::new(std::iter::once(Err(err))))
+        (
+            Box::new(<dyn ValueDecoder>::once(Err(err.clone()))),
+            Box::new(<dyn ValueDecoder>::once(Err(err.clone()))),
+            Box::new(<dyn ValueDecoder>::once(Err(err.clone()))),
+        )
     }
 
     // Split Result<Page> into Result<(Iterator<Values>, Iterator<DefLevels>, Iterator<RepLevels>)>
     // this method could fail, e.g. if the page encoding is not supported
-    fn map_page(page: Page, column_chunk_context: Rc<RefCell<ColumnChunkContext>>, column_desc: &ColumnDescriptor) -> Result<(Box<dyn ValueDecoder>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>, Box<dyn Iterator<Item = Result<LevelBufferPtr>>>)> 
+    fn map_page(page: Page, column_chunk_context: Rc<RefCell<ColumnChunkContext>>, column_desc: &ColumnDescriptor) -> Result<(Box<dyn ValueDecoder>, Box<dyn ValueDecoder>, Box<dyn ValueDecoder>)> 
     {
         // println!(
         //     "ArrowArrayReader::map_page, column: {}, page: {:?}, encoding: {:?}, num values: {:?}", 
@@ -440,8 +242,8 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                 // a dictionary page doesn't return any values
                 Ok((
                     Box::new(<dyn ValueDecoder>::empty()),
-                    Box::new(std::iter::empty()),
-                    Box::new(std::iter::empty()),
+                    Box::new(<dyn ValueDecoder>::empty()),
+                    Box::new(<dyn ValueDecoder>::empty()),
                 ))
             }
             Page::DataPage {
@@ -454,7 +256,7 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
             } => {
                 let mut buffer_ptr = buf;
                 // create rep level decoder iterator
-                let rep_level_iter: Box<dyn Iterator<Item = Result<LevelBufferPtr>>> = if Self::rep_levels_available(&column_desc) {
+                let rep_level_iter: Box<dyn ValueDecoder> = if Self::rep_levels_available(&column_desc) {
                     let mut rep_decoder =
                         LevelDecoder::v1(rep_level_encoding, column_desc.max_rep_level());
                     let rep_level_byte_len = rep_decoder.set_data(
@@ -463,13 +265,13 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                     );
                     // advance buffer pointer
                     buffer_ptr = buffer_ptr.start_from(rep_level_byte_len);
-                    Box::new(rep_decoder)
+                    Box::new(LevelValueDecoder::new(rep_decoder))
                 }
                 else {
-                    Box::new(std::iter::once(Err(ParquetError::General(format!("rep levels are not available")))))
+                    Box::new(<dyn ValueDecoder>::once(Err(ParquetError::General(format!("rep levels are not available")))))
                 };
                 // create def level decoder iterator
-                let def_level_iter: Box<dyn Iterator<Item = Result<LevelBufferPtr>>> = if Self::def_levels_available(&column_desc) {
+                let def_level_iter: Box<dyn ValueDecoder> = if Self::def_levels_available(&column_desc) {
                     let mut def_decoder = LevelDecoder::v1(
                         def_level_encoding,
                         column_desc.max_def_level(),
@@ -480,10 +282,10 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                     );
                     // advance buffer pointer
                     buffer_ptr = buffer_ptr.start_from(def_levels_byte_len);
-                    Box::new(def_decoder)
+                    Box::new(LevelValueDecoder::new(def_decoder))
                 }
                 else {
-                    Box::new(std::iter::once(Err(ParquetError::General(format!("def levels are not available")))))
+                    Box::new(<dyn ValueDecoder>::once(Err(ParquetError::General(format!("def levels are not available")))))
                 };
                 // create value decoder iterator
                 let value_iter = Self::get_value_decoder(
@@ -508,7 +310,7 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
             } => {
                 let mut offset = 0;
                 // create rep level decoder iterator
-                let rep_level_iter: Box<dyn Iterator<Item = Result<LevelBufferPtr>>> = if Self::rep_levels_available(&column_desc) {
+                let rep_level_iter: Box<dyn ValueDecoder> = if Self::rep_levels_available(&column_desc) {
                     let rep_levels_byte_len = rep_levels_byte_len as usize;
                     let mut rep_decoder =
                         LevelDecoder::v2(column_desc.max_rep_level());
@@ -519,13 +321,13 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                         rep_levels_byte_len,
                     );
                     offset += rep_levels_byte_len;
-                    Box::new(rep_decoder)
+                    Box::new(LevelValueDecoder::new(rep_decoder))
                 }
                 else {
-                    Box::new(std::iter::once(Err(ParquetError::General(format!("rep levels are not available")))))
+                    Box::new(<dyn ValueDecoder>::once(Err(ParquetError::General(format!("rep levels are not available")))))
                 };
                 // create def level decoder iterator
-                let def_level_iter: Box<dyn Iterator<Item = Result<LevelBufferPtr>>> = if Self::def_levels_available(&column_desc) {
+                let def_level_iter: Box<dyn ValueDecoder> = if Self::def_levels_available(&column_desc) {
                     let def_levels_byte_len = def_levels_byte_len as usize;
                     let mut def_decoder =
                         LevelDecoder::v2(column_desc.max_def_level());
@@ -536,10 +338,10 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                         def_levels_byte_len,
                     );
                     offset += def_levels_byte_len;
-                    Box::new(def_decoder)
+                    Box::new(LevelValueDecoder::new(def_decoder))
                 }
                 else {
-                    Box::new(std::iter::once(Err(ParquetError::General(format!("def levels are not available")))))
+                    Box::new(<dyn ValueDecoder>::once(Err(ParquetError::General(format!("def levels are not available")))))
                 };
 
                 // create value decoder iterator
@@ -631,22 +433,10 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         }
     }
 
-    fn build_level_array(level_buffers: impl IntoIterator<Item = Result<LevelBufferPtr>>) -> Result<Int16Array> {
-        let level_buffer_iter = level_buffers.into_iter();
-        // SplittableBatchingIterator returns batch_size as upper size hint
-        let value_count_hint = level_buffer_iter.size_hint().1.unwrap_or(0);
-        // println!("ArrowArrayReader::build_level_array, value_count_hint: {}", value_count_hint);
-        let value_size = std::mem::size_of::<i16>();
-        let values_byte_len = value_count_hint * value_size;
-        let mut value_buffer = MutableBuffer::new(values_byte_len);
-        for level_buffer in level_buffer_iter {
-            value_buffer.extend_from_slice(level_buffer?.data());
-        }
-        let actual_value_count = value_buffer.len() / value_size;
-        let array_data = arrow::array::ArrayData::builder(ArrowType::Int16)
-            .len(actual_value_count)
-            .add_buffer(value_buffer.into())
-            .build();
+    fn build_level_array(level_decoder: &mut impl ValueDecoder, batch_size: usize) -> Result<Int16Array> {
+        use arrow::datatypes::Int16Type;
+        let level_converter = PrimitiveArrayConverter::<Int16Type>::new();
+        let array_data = level_converter.convert_value_bytes(level_decoder, batch_size)?;
         Ok(Int16Array::from(array_data))
     }
 }
@@ -663,8 +453,7 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
         if Self::rep_levels_available(&self.column_desc) {
             // read rep levels if available
-            let rep_level_iter = self.rep_level_iter_factory.get_batch_iter(batch_size);
-            let rep_level_array = Self::build_level_array(rep_level_iter)?;
+            let rep_level_array = Self::build_level_array(&mut self.rep_level_decoder, batch_size)?;
             self.last_rep_levels = Some(rep_level_array);
         }
         
@@ -675,9 +464,8 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
         }
         else {
             // if def levels are available - they determine how many values will be read
-            let def_level_iter = self.def_level_iter_factory.get_batch_iter(batch_size);
             // decode def levels, return first error if any
-            let def_level_array = Self::build_level_array(def_level_iter)?;
+            let def_level_array = Self::build_level_array(&mut self.def_level_decoder, batch_size)?;
             let def_level_count = def_level_array.len();
             // use eq_scalar to efficiently build null bitmap array from def levels
             let null_bitmap_array = arrow::compute::eq_scalar(&def_level_array, self.column_desc.max_def_level())?;
@@ -696,13 +484,6 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
 
         // read a batch of values
         // println!("ArrowArrayReader::next_batch, batch_size: {}, values_to_read: {}", batch_size, values_to_read);
-        
-        // NOTE: collecting value chunks here is actually slower
-        // TODO: re-evaluate when iterators are migrated to async streams
-        // collect and unwrap values into Vec, return first error if any
-        // this will separate reading and decoding values from creating an arrow array
-        // extra memory is allocated for the Vec, but the values still point to the page buffer
-        // let values: Vec<ValueByteChunk> = value_iter.collect::<Result<_>>()?;
 
         // converter only creates a no-null / all value array data
         let mut value_array_data = self.array_converter.convert_value_bytes(&mut self.value_decoder, values_to_read)?;
@@ -853,6 +634,43 @@ impl<I: Iterator<Item = Box<dyn ValueDecoder>>> ValueDecoder for CompositeValueD
         }
 
         Ok(num_values - values_to_read)
+    }
+}
+
+struct LevelValueDecoder {
+    level_decoder: crate::encodings::levels::LevelDecoder,
+    level_value_buffer: Vec<i16>,
+}
+
+impl LevelValueDecoder {
+    fn new(level_decoder: crate::encodings::levels::LevelDecoder) -> Self {
+        Self {
+            level_decoder,
+            level_value_buffer: vec![0i16; 2048],
+        }
+    }
+}
+
+impl ValueDecoder for LevelValueDecoder {
+    fn read_value_bytes(&mut self, num_values: usize, read_bytes: &mut dyn FnMut(&[u8], usize)) -> Result<usize> {
+        let value_size = std::mem::size_of::<i16>();
+        let mut total_values_read = 0;
+        while total_values_read < num_values {
+            let values_to_read = std::cmp::min(num_values - total_values_read, self.level_value_buffer.len());
+            let values_read = match self.level_decoder.get(&mut self.level_value_buffer[..values_to_read]) {
+                Ok(values_read) => values_read,
+                Err(e) => return Err(e),
+            };
+            if values_read > 0 {
+                let level_value_bytes = &self.level_value_buffer.to_byte_slice()[..values_read * value_size];
+                read_bytes(level_value_bytes, values_read);
+                total_values_read += values_read;
+            }
+            else {
+                break;
+            }
+        }
+        Ok(total_values_read)
     }
 }
 
@@ -1035,7 +853,6 @@ pub(crate) struct VariableLenDictionaryDecoder {
     key_data_bufer: ByteBufferPtr,
     num_values: usize,
     rle_decoder: RleDecoder,
-    // value_buffer: VecDeque<ValueByteChunk>,
     keys_buffer: Vec<i32>,
 }
 
@@ -1051,7 +868,6 @@ impl VariableLenDictionaryDecoder {
             key_data_bufer,
             num_values,
             rle_decoder,
-            // value_buffer: VecDeque::with_capacity(128),
             keys_buffer: vec![0; 2048],
         }
     }
@@ -1088,17 +904,23 @@ impl ValueDecoder for VariableLenDictionaryDecoder {
     }
 }
 
-pub struct Int32ArrayConverter {}
+use arrow::datatypes::ArrowPrimitiveType;
 
-impl Int32ArrayConverter {
+pub struct PrimitiveArrayConverter<T: ArrowPrimitiveType> {
+    _phantom_data: PhantomData<T>,
+}
+
+impl<T: ArrowPrimitiveType> PrimitiveArrayConverter<T> {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            _phantom_data: PhantomData,
+        }
     }
 }
 
-impl ArrayConverter for Int32ArrayConverter {
+impl<T: ArrowPrimitiveType> ArrayConverter for PrimitiveArrayConverter<T> {
     fn convert_value_bytes(&self, value_decoder: &mut impl ValueDecoder, num_values: usize) -> Result<arrow::array::ArrayData> {
-        let value_size = std::mem::size_of::<i32>();
+        let value_size = T::get_byte_width();
         let values_byte_capacity = num_values * value_size;
         let mut values_buffer = MutableBuffer::new(values_byte_capacity);
 
@@ -1108,7 +930,7 @@ impl ArrayConverter for Int32ArrayConverter {
 
         // calculate actual data_len, which may be different from the iterator's upper bound
         let value_count = values_buffer.len() / value_size;
-        let array_data = arrow::array::ArrayData::builder(ArrowType::Int32)
+        let array_data = arrow::array::ArrayData::builder(T::DATA_TYPE)
             .len(value_count)
             .add_buffer(values_buffer.into())
             .build();
@@ -1218,7 +1040,7 @@ mod tests {
         let column_desc = schema.column(0);
         let page_iterator = EmptyPageIterator::new(schema);
 
-        let converter = Int32ArrayConverter::new();
+        let converter = PrimitiveArrayConverter::<arrow::datatypes::Int32Type>::new();
         let mut array_reader = ArrowArrayReader::try_new(
             page_iterator, column_desc, converter, None
         ).unwrap();
@@ -1305,7 +1127,7 @@ mod tests {
             let page_iterator =
                 InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
 
-            let converter = Int32ArrayConverter::new();
+            let converter = PrimitiveArrayConverter::<arrow::datatypes::Int32Type>::new();
             let mut array_reader = ArrowArrayReader::try_new(
                 page_iterator, column_desc, converter, None
             ).unwrap();
@@ -1388,7 +1210,7 @@ mod tests {
             let page_iterator =
                 InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
 
-            let converter = Int32ArrayConverter::new();
+            let converter = PrimitiveArrayConverter::<arrow::datatypes::Int32Type>::new();
             let mut array_reader = ArrowArrayReader::try_new(
                 page_iterator, column_desc, converter, None
             ).unwrap();

@@ -249,8 +249,8 @@ fn bench_array_reader(mut array_reader: impl ArrayReader) -> usize {
 }
 
 fn create_int32_arrow_array_reader(page_iterator: impl PageIterator + 'static, column_desc: ColumnDescPtr) -> impl ArrayReader {
-    use parquet::arrow::arrow_array_reader::{Int32ArrayConverter, ArrowArrayReader};
-    let converter = Int32ArrayConverter::new();
+    use parquet::arrow::arrow_array_reader::{PrimitiveArrayConverter, ArrowArrayReader};
+    let converter = PrimitiveArrayConverter::<arrow::datatypes::Int32Type>::new();
     ArrowArrayReader::try_new(
         page_iterator, column_desc, converter, None
     ).unwrap()

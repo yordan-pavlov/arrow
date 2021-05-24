@@ -156,8 +156,6 @@ pub enum LevelDecoder {
 }
 
 impl LevelDecoder {
-    const BUFFER_SIZE: usize = 1024;
-
     /// Creates new level decoder based on encoding and max definition/repetition level.
     /// This method only initializes level decoder, `set_data` method must be called
     /// before reading any value.
@@ -281,37 +279,6 @@ impl LevelDecoder {
                 Ok(values_read)
             }
         }
-    }
-}
-
-impl Iterator for LevelDecoder {
-    type Item = Result<crate::memory::BufferPtr<i16>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut level_values = vec![0i16; LevelDecoder::BUFFER_SIZE];
-        match self.get(&mut level_values) {
-            Ok(values_read) => {
-                if values_read > 0 {
-                    let mut buffer = crate::memory::BufferPtr::new(level_values);
-                    if values_read < LevelDecoder::BUFFER_SIZE {
-                        // BufferPtr::with_range avoids an extra drop operation
-                        buffer.set_range(0, values_read);
-                    }
-                    Some(Ok(buffer))
-                }
-                else {
-                    None
-                }
-            },
-            Err(e) => Some(Err(e)),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let upper_size = self.get_num_values().map(
-            |x| ceil(x as i64, LevelDecoder::BUFFER_SIZE as i64) as usize
-        );
-        (0, upper_size)
     }
 }
 

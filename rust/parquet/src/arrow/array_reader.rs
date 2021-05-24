@@ -1415,8 +1415,8 @@ impl<'a> ArrayReaderBuilder {
                         column_desc,
                     )?))
                 } else {
-                    use crate::arrow::arrow_array_reader::{Int32ArrayConverter, ArrowArrayReader};
-                    let converter = Int32ArrayConverter::new();
+                    use crate::arrow::arrow_array_reader::{PrimitiveArrayConverter, ArrowArrayReader};
+                    let converter = PrimitiveArrayConverter::<ArrowInt32Type>::new();
                     Ok(Box::new(ArrowArrayReader::try_new(
                         *page_iterator, column_desc, converter, arrow_type
                     )?))
