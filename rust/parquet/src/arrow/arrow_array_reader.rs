@@ -325,7 +325,7 @@ pub struct ArrowArrayReader<'a, C: ArrayConverter + 'a> {
 }
 
 pub(crate) struct ColumnChunkContext {
-    dictionary_values: Option<Vec<ValueByteChunk>>,
+    dictionary_values: Option<Vec<ByteBufferPtr>>,
 }
 
 impl ColumnChunkContext {
@@ -333,6 +333,10 @@ impl ColumnChunkContext {
         Self {
             dictionary_values: None,
         }
+    }
+
+    fn set_dictionary(&mut self, dictionary_values: Vec<ByteBufferPtr>) {
+        self.dictionary_values = Some(dictionary_values);
     }
 }
 
@@ -428,10 +432,10 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
                     return Err(general_err!("Column chunk cannot have more than one dictionary"));
                 }
                 // create plain decoder for dictionary values
-                let value_iter = Self::decode_dictionary_page(buf, num_values as usize, encoding, column_desc)?;
+                let mut dict_decoder = Self::get_dictionary_page_decoder(buf, num_values as usize, encoding, column_desc)?;
                 // decode and cache dictionary values
-                let dictionary_values: Vec<ValueByteChunk> = value_iter.collect::<Result<_>>()?;
-                column_chunk_context.dictionary_values = Some(dictionary_values);
+                let dictionary_values = dict_decoder.read_dictionary_values()?;
+                column_chunk_context.set_dictionary(dictionary_values);
 
                 // a dictionary page doesn't return any values
                 Ok((
@@ -552,13 +556,13 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         }
     }
 
-    fn decode_dictionary_page(values_buffer: ByteBufferPtr, num_values: usize, mut encoding: Encoding, column_desc: &ColumnDescriptor) -> Result<Box<dyn Iterator<Item = Result<ValueByteChunk>>>> {
+    fn get_dictionary_page_decoder(values_buffer: ByteBufferPtr, num_values: usize, mut encoding: Encoding, column_desc: &ColumnDescriptor) -> Result<Box<dyn DictionaryValueDecoder>> {
         if encoding == Encoding::PLAIN || encoding == Encoding::PLAIN_DICTIONARY {
             encoding = Encoding::RLE_DICTIONARY
         }
 
         if encoding == Encoding::RLE_DICTIONARY {
-            Ok(Self::get_plain_value_decoder(values_buffer, num_values, column_desc).into_value_iterator())
+            Ok(Self::get_plain_value_decoder(values_buffer, num_values, column_desc).into_dictionary_decoder())
         } else {
             Err(nyi_err!(
                 "Invalid/Unsupported encoding type for dictionary: {}",
@@ -617,7 +621,7 @@ impl<'a, C: ArrayConverter + 'a> ArrowArrayReader<'a, C> {
         }
     }
 
-    fn get_plain_value_decoder(values_buffer: ByteBufferPtr, num_values: usize, column_desc: &ColumnDescriptor) -> Box<dyn ValueDecoderIterator> {
+    fn get_plain_value_decoder(values_buffer: ByteBufferPtr, num_values: usize, column_desc: &ColumnDescriptor) -> Box<dyn PlainValueDecoder> {
         let value_bit_len = Self::get_column_physical_bit_len(column_desc);
         if value_bit_len == 0 {
             Box::new(VariableLenPlainDecoder::new(values_buffer, num_values))
@@ -751,25 +755,29 @@ impl<C: ArrayConverter> ArrayReader for ArrowArrayReader<'static, C> {
 
 use crate::encodings::rle::RleDecoder;
 
-trait ValueDecoderIterator: ValueDecoder + Iterator<Item = Result<ValueByteChunk>> {
-    fn into_value_decoder(self: Box<Self>) -> Box<dyn ValueDecoder>;
-    fn into_value_iterator(self: Box<Self>) -> Box<dyn Iterator<Item = Result<ValueByteChunk>>>;
-}
-
-impl<T> ValueDecoderIterator for T 
-where T: ValueDecoder + Iterator<Item = Result<ValueByteChunk>> + 'static
-{
-    fn into_value_decoder(self: Box<Self>) -> Box<dyn ValueDecoder> {
-        self
-    }
-
-    fn into_value_iterator(self: Box<Self>) -> Box<dyn Iterator<Item = Result<ValueByteChunk>>> {
-        self
-    }
-}
-
 pub trait ValueDecoder {
     fn read_value_bytes(&mut self, num_values: usize, read_bytes: &mut dyn FnMut(&[u8], usize)) -> Result<usize>;
+}
+
+trait DictionaryValueDecoder {
+    fn read_dictionary_values(&mut self) -> Result<Vec<ByteBufferPtr>>;
+}
+
+trait PlainValueDecoder: ValueDecoder + DictionaryValueDecoder {
+    fn into_value_decoder(self: Box<Self>) -> Box<dyn ValueDecoder>;
+    fn into_dictionary_decoder(self: Box<Self>) -> Box<dyn DictionaryValueDecoder>;
+}
+
+impl<T> PlainValueDecoder for T 
+where T: ValueDecoder + DictionaryValueDecoder + 'static
+{
+    fn into_value_decoder(self: Box<T>) -> Box<dyn ValueDecoder> {
+        self
+    }
+
+    fn into_dictionary_decoder(self: Box<T>) -> Box<dyn DictionaryValueDecoder> {
+        self
+    }
 }
 
 impl dyn ValueDecoder {
@@ -864,6 +872,19 @@ impl FixedLenPlainDecoder {
     }
 }
 
+impl DictionaryValueDecoder for FixedLenPlainDecoder {
+    fn read_dictionary_values(&mut self) -> Result<Vec<ByteBufferPtr>> {
+        let value_byte_len = self.value_bit_len / 8;
+        let available_values = self.data.len() / value_byte_len;
+        let values_to_read = std::cmp::min(available_values, self.num_values);
+        let byte_len = values_to_read * value_byte_len;
+        let values = vec![self.data.range(0, byte_len)];
+        self.num_values = 0;
+        self.data.set_range(self.data.start(), 0);
+        Ok(values)
+    }
+}
+
 impl ValueDecoder for FixedLenPlainDecoder {
     fn read_value_bytes(&mut self, num_values: usize, read_bytes: &mut dyn FnMut(&[u8], usize)) -> Result<usize> {
         if self.data.len() > 0 {
@@ -883,35 +904,6 @@ impl ValueDecoder for FixedLenPlainDecoder {
     }
 }
 
-impl Iterator for FixedLenPlainDecoder {
-    type Item = Result<ValueByteChunk>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.num_values > 0 {
-            // calculate number of values to read
-            let available_values = self.data.len() * 8 / self.value_bit_len;
-            // do not read more than num_values
-            let actual_num_values = std::cmp::min(available_values, self.num_values);
-            let byte_len = actual_num_values * self.value_bit_len / 8;
-            // a single value chunk is returned, containing all values
-            let value_byte_chunk = ValueByteChunk::new(
-                self.data.range(0, byte_len),
-                actual_num_values,
-                self.value_bit_len,
-            );
-            self.num_values = 0;
-            Some(Ok(value_byte_chunk))
-        }
-        else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(1))
-    }
-}
-
 pub(crate) struct VariableLenPlainDecoder {
     data: ByteBufferPtr,
     num_values: usize,
@@ -928,6 +920,31 @@ impl VariableLenPlainDecoder {
     }
 }
 
+impl DictionaryValueDecoder for VariableLenPlainDecoder {
+    fn read_dictionary_values(&mut self) -> Result<Vec<ByteBufferPtr>> {
+        const LEN_SIZE: usize = std::mem::size_of::<u32>();
+        let data = self.data.data();
+        let data_len = data.len();
+        let values_to_read = self.num_values;
+        let mut values = Vec::with_capacity(values_to_read);
+        let mut values_read = 0;
+        while self.position < data_len && values_read < values_to_read {
+            let len: usize = 
+                read_num_bytes!(u32, LEN_SIZE, data[self.position..])
+                as usize;
+            self.position += LEN_SIZE;
+            if data_len < self.position + len {
+                return Err(eof_err!("Not enough bytes to decode"));
+            }
+            values.push(self.data.range(self.position, len));
+            self.position += len;
+            values_read += 1;
+        }
+        self.num_values -= values_read;
+        Ok(values)
+    }
+}
+
 impl ValueDecoder for VariableLenPlainDecoder {
     fn read_value_bytes(&mut self, num_values: usize, read_bytes: &mut dyn FnMut(&[u8], usize)) -> Result<usize> {
         const LEN_SIZE: usize = std::mem::size_of::<u32>();
@@ -937,54 +954,18 @@ impl ValueDecoder for VariableLenPlainDecoder {
         let mut values_read = 0;
         while self.position < data_len && values_read < values_to_read {
             let len: usize = 
-                read_num_bytes!(u32, LEN_SIZE, self.data.data()[self.position..])
+                read_num_bytes!(u32, LEN_SIZE, data[self.position..])
                 as usize;
             self.position += LEN_SIZE;
             if data_len < self.position + len {
                 return Err(eof_err!("Not enough bytes to decode"));
             }
-            read_bytes(&data[self.position..self.position + len], 1);
+            read_bytes(&data[self.position..][..len], 1);
             self.position += len;
             values_read += 1;
         }
         self.num_values -= values_read;
         Ok(values_read)
-    }
-}
-
-impl Iterator for VariableLenPlainDecoder {
-    type Item = Result<ValueByteChunk>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        const LEN_SIZE: usize = std::mem::size_of::<u32>();
-        let data_len = self.data.len();
-        if self.position < data_len && self.num_values > 0 {
-            let len: usize = 
-                read_num_bytes!(u32, LEN_SIZE, self.data.data()[self.position..])
-                as usize;
-            self.position += LEN_SIZE;
-
-            if data_len < self.position + len {
-                return Some(Err(eof_err!("Not enough bytes to decode")));
-            }
-            let value_bytes = self.data.range(self.position, len);
-            self.position += len;
-            self.num_values -= 1;
-            // variable length value chunks contain a single value each
-            let value_byte_chunk = ValueByteChunk::new(
-                value_bytes,
-                1,
-                0,
-            );
-            Some(Ok(value_byte_chunk))
-        }
-        else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.num_values, Some(self.num_values))
     }
 }
 
@@ -1023,10 +1004,7 @@ impl ValueDecoder for FixedLenDictionaryDecoder {
         }
         let context = self.context_ref.borrow();
         let values = context.dictionary_values.as_ref().unwrap();
-        let value_byte_chunk = &values[0];
-        assert!(value_byte_chunk.value_bit_len == self.value_byte_len * 8);
-
-        let input_value_bytes = value_byte_chunk.data.data();
+        let input_value_bytes = values[0].data();
         // read no more than available values or requested values
         let values_to_read = std::cmp::min(self.num_values, num_values);
         let mut values_read = 0;
@@ -1049,44 +1027,6 @@ impl ValueDecoder for FixedLenDictionaryDecoder {
         }
         self.num_values -= values_read;
         Ok(values_read)
-    }
-}
-
-impl Iterator for FixedLenDictionaryDecoder {
-    type Item = Result<ValueByteChunk>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.num_values <= 0 {
-            return None;
-        }
-        let values_to_read = std::cmp::min(self.num_values, self.keys_buffer.len());
-        let keys_read = match self.rle_decoder.get_batch(&mut self.keys_buffer[..values_to_read]) {
-            Ok(keys_read) => keys_read,
-            Err(e) => return Some(Err(e)),
-        };
-        if keys_read == 0 {
-            self.num_values = 0;
-            return None;
-        }
-        let context = self.context_ref.borrow();
-        let values = context.dictionary_values.as_ref().unwrap();
-        let value_byte_chunk = &values[0];
-        assert!(value_byte_chunk.value_bit_len == self.value_byte_len * 8);
-        let input_value_bytes = value_byte_chunk.data.data();
-
-        let mut output_value_bytes = vec![0u8; keys_read * self.value_byte_len];
-        for i in 0..keys_read {
-            let key = self.keys_buffer[i] as usize;
-            output_value_bytes[i * self.value_byte_len..][..self.value_byte_len]
-                .copy_from_slice(&input_value_bytes[key * self.value_byte_len..][..self.value_byte_len]);
-        }
-
-        self.num_values -= keys_read;
-        Some(Ok(ValueByteChunk::new(
-            ByteBufferPtr::new(output_value_bytes), 
-            keys_read, 
-            self.value_byte_len * 8
-        )))
     }
 }
 
@@ -1123,7 +1063,7 @@ impl ValueDecoder for VariableLenDictionaryDecoder {
             return Ok(0);
         }
         let context = self.context_ref.borrow();
-        let value_chunks = context.dictionary_values.as_ref().unwrap();
+        let values = context.dictionary_values.as_ref().unwrap();
         let values_to_read = std::cmp::min(self.num_values, num_values);
         let mut values_read = 0;
         while values_read < values_to_read {
@@ -1139,68 +1079,12 @@ impl ValueDecoder for VariableLenDictionaryDecoder {
             }
             for i in 0..keys_read {
                 let key = self.keys_buffer[i] as usize;
-                let value_chunk = &value_chunks[key];
-                read_bytes(value_chunk.data.data(), 1);
+                read_bytes(values[key].data(), 1);
             }
             values_read += keys_read;
         }
         self.num_values -= values_read;
         Ok(values_read)
-    }
-}
-
-impl Iterator for VariableLenDictionaryDecoder {
-    type Item = Result<ValueByteChunk>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // this simpler, non-buffering implementation is actually a bit faster
-        // TODO: re-evaluate when iterators are replaced with async streams
-        if self.num_values > 0 {
-            let value_index = match self.rle_decoder.get::<i32>() {
-                Ok(maybe_key) => match maybe_key {
-                    Some(key) => key,
-                    None => return None,
-                }
-                Err(e) => return Some(Err(e)),
-            };
-            let context = self.context_ref.borrow();
-            let value_chunk = &context.dictionary_values.as_ref().unwrap()[value_index as usize];
-            self.num_values -= 1;
-            return Some(Ok(value_chunk.clone()));
-        }
-        return None;
-
-        // match self.value_buffer.pop_front() {
-        //     Some(value) => Some(Ok(value)),
-        //     None => {
-        //         if self.num_values <= 0 {
-        //             return None;
-        //         }
-        //         let values_to_read = std::cmp::min(self.num_values, self.keys_buffer.len());
-        //         let keys_read = match self.rle_decoder.get_batch(&mut self.keys_buffer[..values_to_read]) {
-        //             Ok(keys_read) => keys_read,
-        //             Err(e) => return Some(Err(e)),
-        //         };
-        //         if keys_read == 0 {
-        //             self.num_values = 0;
-        //             return None;
-        //         }
-        //         let context = self.context_ref.borrow();
-        //         let values = context.dictionary_values.as_ref().unwrap();
-        //         let first_value = values[self.keys_buffer[0] as usize].clone();
-        //         let values_iter = 
-        //             self.keys_buffer[1..keys_read].iter()
-        //             .map(|key| values[*key as usize].clone());
-        //         self.value_buffer.extend(values_iter);
-                
-        //         self.num_values -= keys_read;
-        //         Some(Ok(first_value))
-        //     }
-        // }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.num_values, Some(self.num_values))
     }
 }
 
@@ -1245,17 +1129,6 @@ impl ArrayConverter for StringArrayConverter {
         use arrow::datatypes::ArrowNativeType;
         let offset_size = std::mem::size_of::<i32>();
         let mut offsets_buffer = MutableBuffer::new((num_values + 1) * offset_size);
-        // NOTE: calculating exact value byte capacity is actually slower with current implementation
-        // TODO: re-evaluate when iterators are migrated to async streams
-        // calculate values_byte_capacity
-        // let mut values_byte_capacity = 0;
-        // let mut value_chunks = Vec::<ValueByteChunk>::with_capacity(value_capacity);
-        // for value_chunk in value_iter {
-        //     let value_chunk = value_chunk?;
-        //     values_byte_capacity += value_chunk.data.len();
-        //     value_chunks.push(value_chunk);
-        // }
-
         // allocate initial capacity of 1 byte for each item
         let values_byte_capacity = num_values;
         let mut values_buffer = MutableBuffer::new(values_byte_capacity);
